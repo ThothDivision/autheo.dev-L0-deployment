@@ -56,9 +56,12 @@ mod identity;
 mod incidents;
 mod inference;
 mod integrations;
+mod integrity_signer;
 mod lease;
+mod marketplace;
 mod memwatch;
 mod mesh_raw;
+mod mesh_shell;
 mod meshwatch;
 mod metrics;
 mod microfrontends;
@@ -414,6 +417,11 @@ async fn async_main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // The default hook still prints exactly as before, while this additionally
+    // leaves the first panic on disk for restart_audit. That is essential for
+    // a double-panic abort: Rust's final "panic in a destructor" line hides
+    // the original failure that actually needs fixing.
+    restart_audit::install_panic_hook();
     // Install the process-level rustls CryptoProvider FIRST (later installs
     // are idempotent no-ops). The dep tree links both `ring` and `aws-lc-rs`
     // rustls features, so any rustls user that runs before one of the lazy
@@ -576,12 +584,7 @@ async fn async_main() -> anyhow::Result<()> {
     // Backend kind ("firecracker"|"litebox"|"mock") captured alongside the
     // backend — gossiped so the placement scheduler only auto-targets
     // production isolation backends (never the local/mock Mac nodes).
-    // `sandbox_fc` retains the CONCRETE type (Sandboxes' exec/kill methods are
-    // Firecracker-specific, not part of the generic `CellBackend` trait object
-    // every other subsystem sees).
     let sandbox_fc_supported = firecracker.is_supported() && !force_mock;
-    let sandbox_fc: Option<Arc<FirecrackerBackend>> =
-        sandbox_fc_supported.then(|| firecracker.clone());
     // Litebox Tier 2: NEVER auto-detected live (see `LiteboxBackend::smoke_test`'s
     // doc comment and AGENTS.md's PVM two-tier precedent) — an operator runs
     // `--litebox-probe` once during bring-up on an idle node and only then
@@ -593,6 +596,22 @@ async fn async_main() -> anyhow::Result<()> {
         .map(|v| v == "1")
         .unwrap_or(false);
     let litebox_supported = litebox.is_supported() && litebox_verified && !sandbox_fc_supported;
+    // Sandboxes' own backend selection mirrors the main isolation-backend
+    // ranking one step behind (Firecracker -> Litebox -> none, never Mock —
+    // an unsandboxed dev host reports EngineUnavailable instead of a fake
+    // "sandbox" that doesn't isolate anything). `exec_command`/`exec_pty` are
+    // now generic `CellBackend` trait methods (previously Firecracker-only
+    // inherent methods), so this can hold a trait object like every other
+    // subsystem instead of the concrete Firecracker type.
+    let sandbox_backend: Option<Arc<dyn CellBackend>> = if sandbox_fc_supported {
+        Some(firecracker.clone())
+    } else if litebox_supported {
+        Some(litebox.clone())
+    } else {
+        None
+    };
+    let sandbox_firecracker: Option<Arc<FirecrackerBackend>> =
+        sandbox_fc_supported.then(|| firecracker.clone());
     let litebox_runtime_capabilities = resources::RuntimeCapabilitySource::litebox(litebox.clone());
     let (backend, backend_name, runtime_capability_source): (
         Arc<dyn CellBackend>,
@@ -624,6 +643,9 @@ async fn async_main() -> anyhow::Result<()> {
                 root: std::env::temp_dir().join("hive-cloud-cells"),
                 provision_latency: Duration::from_millis(200),
                 cache_root: std::env::temp_dir().join("hive-cloud-cache"),
+                // Durable: must survive a hive-node restart, unlike root/cache_root
+                // above. Lives next to the sealed artifacts it describes.
+                receipts_dir: crate::persist::data_dir().join("runtime-artifacts-v1"),
             })),
             "mock",
             resources::RuntimeCapabilitySource::mock(),
@@ -705,7 +727,7 @@ async fn async_main() -> anyhow::Result<()> {
     // A declaration is never enough: initialization re-hashes runsc and the
     // nft policy, checks the exact network/image/runtime, then executes a real
     // runsc + quota + nested-Buildah probe. Any fault advertises no capability.
-    let build_isolation_protocol = match build_executor::init_installed().await {
+    let _build_isolation_protocol = match build_executor::init_installed().await {
         Ok(protocol) => {
             tracing::info!(protocol, "BuildExecutor live probe passed");
             Some(protocol)
@@ -1071,7 +1093,8 @@ async fn async_main() -> anyhow::Result<()> {
         gw.clone(),
         fluid,
         hive,
-        sandbox_fc,
+        sandbox_firecracker,
+        sandbox_backend,
     );
     // Fill the embedded relay's deferred AccessControl cell now that
     // CloudState finally exists (it was constructed and wired into the relay
@@ -1079,6 +1102,13 @@ async fn async_main() -> anyhow::Result<()> {
     // `Weak` deliberately: the AccessControl impl must never be the thing
     // keeping CloudState alive.
     let _ = browser_relay_access_cell.set(Arc::downgrade(&cloud));
+    // Same deferred-fill shape: Fluid was constructed before CloudState (and
+    // therefore before deployment_ledger, the integrity chain's backing
+    // store) existed, so the observer is wired in here instead of at
+    // `Fluid::start`.
+    cloud.fluid.set_execution_observer(
+        crate::deployment_ledger::LedgerExecutionObserver::new(cloud.deployment_ledger.clone()),
+    );
     // Advertise the sealed-artifact transfer receiver only after CloudState
     // construction PROVED it initialized (durable store opened, worker
     // spawned, interrupted transactions recovered). A receiver that failed
@@ -1189,27 +1219,58 @@ async fn async_main() -> anyhow::Result<()> {
             // fleet treated the dark leader as current. The watchdog turns any
             // wedged step into the bounded restart the caller asked for; the exit
             // code matches what the normal tail would have used.
+            //
+            // It runs on a plain OS thread, NOT a tokio timer: a wedge that
+            // parks the worker owning tokio's IO/timer driver stops every timer
+            // on the runtime, this one included (measured: 34 of 56 stops on
+            // 90 s nodes ended in SIGKILL with every timer dead), and a std
+            // thread sleeping on the OS clock exits regardless of the runtime's
+            // state. The 75 s default must stay below systemd's TimeoutStopSec
+            // (90 s in hive-node.service) so the exit is ours, never SIGKILL's.
             {
-                let deadline = Duration::from_secs(env_u64("HIVE_SHUTDOWN_DEADLINE_SECS", 90));
+                let deadline = Duration::from_secs(env_u64("HIVE_SHUTDOWN_DEADLINE_SECS", 75));
                 let code = if requested_reason.is_some() { 17 } else { 0 };
-                tokio::spawn(async move {
-                    tokio::time::sleep(deadline).await;
+                let spawned = std::thread::Builder::new()
+                    .name("hive-shutdown-deadline".into())
+                    .spawn(move || {
+                        std::thread::sleep(deadline);
+                        tracing::error!(
+                            ?deadline,
+                            exit_code = code,
+                            "graceful shutdown exceeded its hard deadline — forcing exit now"
+                        );
+                        std::process::exit(code);
+                    });
+                if let Err(error) = spawned {
                     tracing::error!(
-                        ?deadline,
-                        exit_code = code,
-                        "graceful shutdown exceeded its hard deadline — forcing exit now"
+                        %error,
+                        "could not spawn the shutdown hard-deadline thread; systemd's TimeoutStopSec is the only backstop"
                     );
-                    std::process::exit(code);
-                });
+                }
             }
             let grace = Duration::from_secs(env_u64("HIVE_SHUTDOWN_GRACE_SECS", 15));
             if let Some(handle) = SHUTDOWN_HTTPS_HANDLE.get() {
                 tracing::info!(?grace, "shutdown requested → draining public listener (in-flight requests + cell tunnels)");
                 handle.graceful_shutdown(Some(grace));
                 // graceful_shutdown stops new connections and gives existing ones
-                // the grace window; wait for it here since exit() below would
-                // otherwise kill them the instant this task returns regardless.
-                tokio::time::sleep(grace).await;
+                // the grace window; wait for them here since exit() below would
+                // otherwise kill them the instant this task returns — but only
+                // while any remain. An unconditional sleep charged every stop the
+                // full 15 s on an idle listener (measured: the 78 s graceful
+                // path spent 15 s here with zero connections open).
+                let drain_started = std::time::Instant::now();
+                loop {
+                    let open = handle.connection_count();
+                    if open == 0 || drain_started.elapsed() >= grace {
+                        tracing::info!(
+                            open_connections = open,
+                            elapsed_ms = drain_started.elapsed().as_millis() as u64,
+                            "public listener drained"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
             }
             tracing::info!("shutdown requested → draining runtime artifact transfers");
             if let Err(error) = flush_cloud.runtime_artifact_transfer.shutdown().await {
@@ -1787,6 +1848,14 @@ async fn async_main() -> anyhow::Result<()> {
     // from the local registry and comes out empty. See `meshwatch`.
     meshwatch::spawn(cloud.clone(), controlled_restart.clone());
     tenancy_reconcile::spawn(cloud.clone());
+    // Host listener audit. Every node (listeners are per-host). Anything not
+    // this process bound to a wildcard address inside the internet-open
+    // published-port range is world-reachable through the security group and
+    // otherwise invisible: two week-old `python3 -m http.server` hand-offs on
+    // fc-virginia:28126/:28127 were found by the cloud provider's scanner, not
+    // by the platform (2026-08-27 ticket). Detects and reports only; never
+    // kills. See `listener_audit`.
+    listener_audit::spawn(cloud.clone(), |c| c.is_control_plane_leader());
     spawn_deletion_reconcile_loop(cloud.clone());
 
     // Restart-audit heartbeat. Writes the marker the NEXT boot classifies
@@ -1841,6 +1910,9 @@ async fn async_main() -> anyhow::Result<()> {
             .unwrap_or(120),
     );
     let admin_router = admin::router(cloud.clone())
+        // Marketplace is authenticated with its own service credential inside
+        // the module; it must never consume a DevHub hive_jwt.
+        .merge(crate::marketplace::routes().with_state(cloud.clone()))
         // guardian-growth-and-gc-observability: guardian.rs owns this route's
         // handler/state end-to-end (single-writer scope), so it merges here
         // rather than adding a line inside admin::router() itself. Same
@@ -1856,7 +1928,10 @@ async fn async_main() -> anyhow::Result<()> {
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             admin_max_body,
         ))
-        .layer(tower_http::timeout::TimeoutLayer::new(admin_req_timeout));
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            admin_req_timeout,
+        ));
     if auth::enforced() {
         tracing::info!("JWT auth enforced on admin mutations (HIVE_JWT_SECRET set)");
     }
@@ -2176,6 +2251,12 @@ fn owner_routed(path: &str) -> bool {
         // mutate a different host's transaction journal (or fail WrongTarget)
         // and make resumable delivery impossible across leader changes.
         || path.starts_with("/v1/runtime-artifact-transfer/v1/")
+        // Sandbox owner RPCs (`sandboxes_api`'s delegate-create / owner-op) are
+        // addressed by the LEADER to the exact node that holds — or is being
+        // asked to provision — the cell. Bouncing them back to the leader would
+        // re-run the create on a node with no exec backend (the fail-closed
+        // refusal the delegation exists to route around) or deadlock the hop.
+        || path.starts_with("/v1/internal/sandboxes/")
 }
 
 /// Loopback-admin mutation forwarding (the admin_ingress leader rule, applied
@@ -2450,6 +2531,9 @@ async fn admin_ingress(
             || path == "/v1/git/webhook"
             || path == "/v1/zkauth/register"
             || path == "/v1/zkauth/preview-proof"
+            // Separate Marketplace service authentication is checked by its
+            // handlers, never by the DevHub hive_jwt gate.
+            || path.starts_with("/v1/marketplace/")
             // Per-database bearer, not a platform JWT — see auth::require_auth.
             || path.starts_with("/v1/sqlite/")
             // Per-project browser_db REST bearer, not a platform JWT — see
@@ -2561,7 +2645,7 @@ const MAX_STALE_EPOCH_RETRIES: u32 = 3;
 /// The connect timeout is separate from (and far tighter than) the overall
 /// request timeout: a candidate whose address black-holes must not burn the
 /// whole 30s budget before the next candidate is tried.
-fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
+pub(crate) fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
     > = std::sync::OnceLock::new();
@@ -2604,7 +2688,7 @@ fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
 /// NOT health-filtered, because the stale health verdict is precisely the input
 /// that just misled us. Self is skipped (we already know we are not the leader,
 /// so a round trip to our own public address can only refuse again).
-fn leader_forward_candidates(cloud: &Arc<CloudState>) -> Vec<(String, String)> {
+pub(crate) fn leader_forward_candidates(cloud: &Arc<CloudState>) -> Vec<(String, String)> {
     let nodes = cloud.registry.nodes();
     let addr_of = |name: &str| -> Option<String> {
         nodes
@@ -5022,6 +5106,141 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
             }
             if !acting {
                 continue;
+            }
+            // Ephemeral ledger checkpoint pruning — SAME leader-elected `acting`
+            // gate above, no separate election mechanism. Runs every tick
+            // regardless of fleet-wide usage activity: a tenant with a
+            // finalized, durable, grace-period-elapsed checkpoint is prune-
+            // eligible even in a tick with zero function stats (this must
+            // NOT be gated behind the `stats.is_empty()` early-return below,
+            // which only concerns metering — a tenant that stops generating
+            // usage must still get pruned). A checkpoint is a tamper-evident
+            // SHA-256 hash chain (NOT a zk-SNARK/STARK: the verifier is this
+            // platform's own process, never an external party, so there is
+            // nothing for real ZK cryptography to buy here — see
+            // billing::LedgerCheckpoint's doc comment), computed once at
+            // period-close in `BillingStore::account()`'s rollover branch.
+            // Once a checkpoint is durable and its grace period has elapsed,
+            // the raw entries it covers become eligible for pruning from
+            // both the relational mirror and the in-memory ledger — never
+            // the account itself (billing.rs's `remove_account` stays
+            // untouched; pruning and account deletion are orthogonal by
+            // construction).
+            // Tenants that had at least one checkpoint pruned this tick — the
+            // in-memory `pruned=true` flag they now carry must be mirrored
+            // even on a quiet tick (zero fleet-wide usage), since the normal
+            // per-tenant mirror write below only runs for tenants present in
+            // `stats`/`metered`, and this whole block deliberately runs
+            // BEFORE that early-return so a usage-quiet tenant still prunes.
+            let mut pruned_tenants: Vec<String> = Vec::new();
+            for acc in cloud.billing.all_accounts() {
+                let tenant = acc.tenant.as_str();
+                let invs = cloud.billing.finalized_invoices(tenant);
+                for inv in &invs {
+                    let Some(cp) = inv.ledger_checkpoint.as_ref() else {
+                        continue;
+                    };
+                    if cp.pruned {
+                        continue;
+                    }
+                    let grace = env_u64("HIVE_LEDGER_PRUNE_GRACE_MS", 7 * 24 * 60 * 60 * 1000);
+                    if now_ms().saturating_sub(inv.created_ms) < grace {
+                        continue;
+                    }
+                    // Durability gate: never prune the in-memory copy ahead of
+                    // the relational mirror having actually caught up — skip
+                    // and retry next tick if it hasn't.
+                    let mirrored = match relational::count_billing_ledger_rows(
+                        tenant,
+                        cp.period_start_ms,
+                        cp.period_end_ms,
+                    )
+                    .await
+                    {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::warn!(tenant, error = %e, "ledger checkpoint prune: relational count failed, retrying next tick");
+                            continue;
+                        }
+                    };
+                    if mirrored != cp.entry_count {
+                        tracing::debug!(
+                            tenant,
+                            mirrored,
+                            expected = cp.entry_count,
+                            "ledger checkpoint prune: relational mirror not yet caught up, retrying next tick"
+                        );
+                        continue;
+                    }
+                    // Blast-radius guard: recompute the commitment fresh from
+                    // the CURRENT in-memory rows for this exact range; refuse
+                    // loudly rather than deleting data that no longer matches
+                    // what was proven.
+                    let fresh = cloud.billing.compute_ledger_checkpoint(
+                        tenant,
+                        cp.period_start_ms,
+                        cp.period_end_ms,
+                    );
+                    if fresh.commitment != cp.commitment || fresh.entry_count != cp.entry_count {
+                        tracing::warn!(
+                            tenant,
+                            expected_commitment = %cp.commitment,
+                            fresh_commitment = %fresh.commitment,
+                            expected_entry_count = cp.entry_count,
+                            fresh_entry_count = fresh.entry_count,
+                            "ledger checkpoint prune REFUSED: commitment mismatch (data changed since checkpoint was proven)"
+                        );
+                        continue;
+                    }
+                    // Relational prune before in-memory prune, always — a
+                    // crash between the two just retries cleanly next tick
+                    // (both DELETE and retain are idempotent on an
+                    // already-empty range).
+                    if let Err(e) = relational::prune_billing_ledger(
+                        tenant,
+                        cp.period_start_ms,
+                        cp.period_end_ms,
+                    )
+                    .await
+                    {
+                        tracing::warn!(tenant, error = %e, "ledger checkpoint prune: relational delete failed, retrying next tick");
+                        continue;
+                    }
+                    let removed =
+                        cloud
+                            .billing
+                            .prune_ledger_range(tenant, cp.period_start_ms, cp.period_end_ms);
+                    cloud.billing.mark_checkpoint_pruned(tenant, cp.period_start_ms);
+                    tracing::info!(
+                        tenant,
+                        removed,
+                        period_start_ms = cp.period_start_ms,
+                        period_end_ms = cp.period_end_ms,
+                        commitment = %cp.commitment,
+                        "ledger checkpoint: raw entries pruned, commitment + invoice retained"
+                    );
+                    if !pruned_tenants.iter().any(|t| t == tenant) {
+                        pruned_tenants.push(tenant.to_string());
+                    }
+                }
+            }
+            if !pruned_tenants.is_empty() {
+                let owned: Vec<_> = pruned_tenants
+                    .iter()
+                    .map(|tenant| {
+                        (
+                            cloud.billing.account(tenant),
+                            cloud.billing.ledger(tenant),
+                            cloud.billing.finalized_invoices(tenant),
+                            cloud.billing.checkouts_for_tenant(tenant),
+                        )
+                    })
+                    .collect();
+                let batch: Vec<relational::BillingRows<'_>> = owned
+                    .iter()
+                    .map(|(a, l, i, c)| (a, l.as_slice(), i.as_slice(), c.as_slice()))
+                    .collect();
+                relational::upsert_billing_many(&batch).await;
             }
             let stats = admin::fleet_function_stats(&cloud).await;
             if stats.is_empty() {

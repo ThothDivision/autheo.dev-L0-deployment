@@ -4,6 +4,34 @@ import { useEffect, useState, useCallback } from "react";
 
 const BASE = "/cloud";
 
+/**
+ * Base `ws(s)://` origin for routes that need a real websocket — the sandbox
+ * interactive shell is the first one. Next.js's `rewrites()` (what `/cloud`
+ * uses for every other API call) proxies plain HTTP only; it cannot forward
+ * a websocket `Upgrade` handshake, so this connects DIRECTLY to the admin
+ * host instead of going through `/cloud`.
+ *
+ * `NEXT_PUBLIC_HIVE_WS_ADMIN` (e.g. `wss://api.shadw.cloud`), when set at
+ * build time, wins outright. Otherwise derive same-domain from the
+ * dashboard's own hostname (`shadw.cloud` → `api.shadw.cloud`, the
+ * `HIVE_PLATFORM_DOMAIN`/`api.` convention this platform already uses
+ * everywhere else) so a fresh deploy needs no extra config; local dev
+ * (`localhost`/`127.0.0.1`) falls back to this browser's own admin port.
+ */
+export function wsBase(): string {
+  const configured = process.env.NEXT_PUBLIC_HIVE_WS_ADMIN;
+  if (configured) return configured.replace(/\/$/, "");
+  if (typeof window === "undefined") return "";
+  const { protocol, hostname } = window.location;
+  const wsProto = protocol === "https:" ? "wss:" : "ws:";
+  if (hostname === "localhost" || hostname === "127.0.0.1") {
+    return `${wsProto}//${hostname}:8786`;
+  }
+  const parts = hostname.split(".");
+  const apiHost = parts.length > 2 ? `api.${parts.slice(-2).join(".")}` : `api.${hostname}`;
+  return `${wsProto}//${apiHost}`;
+}
+
 /** Current tenant (team) for scoping all dashboard reads/writes.
  *
  * MULTI-TENANCY: an ORG scope resolves to the org slug (already isolated). The
@@ -220,16 +248,25 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   // 401 = expired/invalid session. 403 ALSO covers the no-cookie-at-all case:
   // the enforced ingress answers a missing hive_jwt with 403 (operator/tenant
   // guard), not 401 — e.g. right after sign-in before the first mint landed, or
-  // when an earlier mint failed. Both get ONE transparent re-mint + retry; a
-  // genuine authorization denial (wrong tenant/role) simply fails again on the
-  // retry and propagates, so this cannot loop per-request. The cooldown keeps a
-  // PERSISTENTLY-403 endpoint on a 3-4s poll from turning every cycle into an
-  // /api/token round trip: one automatic re-mint per window is plenty (a
+  // when an earlier mint failed. `x-hive-anon: 1` is the THIRD, GET-specific
+  // case: a read is never rejected for missing auth (backend `auth.rs`'s
+  // `require_auth` lets every GET/HEAD through), so an unauthenticated one
+  // silently resolves to `admin::ANON_TENANT` and returns a real 200 with a
+  // wrongly-scoped empty/anonymous body — a stale/expired cookie or a
+  // mint-race renders as a permanently-empty list with no error, since 200 is
+  // never what the pre-existing 401/403 branch below was watching for
+  // (live-reported: the API Keys page appearing to silently drop a just-created
+  // key on refresh). All three get ONE transparent re-mint + retry; a genuine
+  // authorization denial (wrong tenant/role) simply fails again on the retry
+  // and propagates, so this cannot loop per-request. The cooldown keeps a
+  // PERSISTENTLY-anonymous endpoint on a 3-4s poll from turning every cycle into
+  // an /api/token round trip: one automatic re-mint per window is plenty (a
   // successful mint fixes every subsequent request anyway). This is an
   // AUTOMATIC mint path, so it also respects the shared failure budget: while
   // minting is in backoff or suspended (`failed`), re-minting here cannot
   // succeed any harder than it just did, so the response propagates as-is.
-  if ((r.status === 401 || r.status === 403) && typeof window !== "undefined" && MINT_ON) {
+  const isAnon = r.headers.get("x-hive-anon") === "1";
+  if ((r.status === 401 || r.status === 403 || isAnon) && typeof window !== "undefined" && MINT_ON) {
     const now = Date.now();
     if (mintState === "failed" || now < mintNextAutoAttemptAt) return r;
     if (now - lastAutoMintAt < AUTO_MINT_COOLDOWN_MS) return r;
@@ -617,6 +654,10 @@ export function usePoll<T>(path: string, intervalMs = 3000, active = true, initi
   const refresh = useCallback(() => load(false), [load]);
 
   useEffect(() => {
+    // load() is async and only calls setState after its own await (a real
+    // network fetch) resolves — the legitimate "fetch on mount" pattern, not
+    // a synchronous setState-during-effect.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load(false); // initial mount: cache-eligible (helps cross-nav + co-mounted siblings)
     // Recurring ticks RESPECT the per-path TTL (load(false)): a live path (short
     // default TTL) still refreshes ~every tick, while a stable path (long TTL,
@@ -715,6 +756,10 @@ export function useOpsPoll<T>(path: string, intervalMs = 3000, active = true, in
   const refresh = useCallback(() => load(false), [load]);
 
   useEffect(() => {
+    // Same as usePoll above: load() is async, setState only runs after its
+    // own network await resolves — legitimate fetch-on-mount, not a
+    // synchronous setState-during-effect.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load(false);
     const id = active ? setInterval(() => load(false), intervalMs) : null; // respect per-path TTL
     const onTeam = () => { setData(null); setError(null); setLoading(true); load(true); };
@@ -1701,7 +1746,6 @@ export interface BillingAccount {
   included_cents: number;
   used_cents: number;
   balance_cents: number;
-  stripe_customer: string;
   period_start_ms: number;
   period_end_ms: number;
   updated_ms: number;
@@ -1709,7 +1753,6 @@ export interface BillingAccount {
 export interface BillingInfo {
   account: BillingAccount;
   plans: PlanSpec[];
-  stripe: boolean;
   rate_card?: RateCard;
   limits?: PlanLimits;
   current_invoice?: Invoice;

@@ -33,21 +33,8 @@ use std::sync::Arc;
 /// gates on this exact string before ever creating a checkout with `kind == "addon"`.
 pub const SKU: &str = "dedicated_ipv4";
 
-/// Real Stripe recurring price id for the addon, operator-configured —
-/// deliberately NOT a hard-coded `price_...` literal (unlike `plan_spec`'s
-/// tier prices): this repo's own tooling must never be able to charge a real
-/// Stripe price by accident, and there is no real price id to hard-code
-/// until an operator actually creates one in the Stripe dashboard.
-pub fn price_id() -> Option<String> {
-    std::env::var("HIVE_DEDICATED_IPV4_PRICE_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-}
-
 /// Price (USD cents/mo) used for the checkout's own `amount_cents`
-/// bookkeeping and the invoice line — mirrors how `PlanSpec::price_cents` is
-/// the informational amount even though a real charge (once one exists)
-/// would be governed by the Stripe price object once `price_id()` is set.
+/// bookkeeping and the invoice line.
 ///
 /// Temporarily 0 for testing (operator decision, not a permanent price):
 /// `admin::billing_checkout`'s `amount == 0` branch applies ANY $0 purchase
@@ -80,6 +67,53 @@ pub fn preflight() -> Result<(), String> {
         non_empty_env(key)?;
     }
     Ok(())
+}
+
+/// Ask the control-plane leader's own `preflight()` verdict when THIS node's
+/// is `Err` — see `admin::billing_addons`'s doc comment for why a node-local
+/// answer alone is wrong for this specific check. Best-effort: `None` means
+/// "could not ask" (leader unreachable, no candidates, bad response) and the
+/// caller must fall back to the local verdict — never turn a reachability
+/// hiccup into a harder "unavailable" than the local check already gave.
+pub async fn leader_preflight(cloud: &Arc<CloudState>) -> Option<Result<(), String>> {
+    let api_host = format!("api.{}", cloud.platform_domain);
+    for (_name, ip) in crate::leader_forward_candidates(cloud) {
+        let client = match crate::leader_client(&ip, &api_host) {
+            Some(c) => c,
+            None => continue,
+        };
+        let url = format!("https://{api_host}/v1/billing/addons");
+        let mut req = client.get(&url).header("host", &api_host);
+        if let Ok(token) = std::env::var("HIVE_INTERNAL_TOKEN") {
+            if !token.trim().is_empty() {
+                req = req.header("x-hive-internal", token);
+            }
+        }
+        let resp = match req.send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+        let body: serde_json::Value = match resp.json().await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let addon = body.get("addons").and_then(|a| a.get(0));
+        let Some(available) = addon.and_then(|a| a.get("available")).and_then(|v| v.as_bool())
+        else {
+            continue;
+        };
+        return Some(if available {
+            Ok(())
+        } else {
+            let reason = addon
+                .and_then(|a| a.get("unavailable_reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unavailable on the control-plane leader")
+                .to_string();
+            Err(reason)
+        });
+    }
+    None
 }
 
 pub async fn provision_from_checkout(
@@ -148,7 +182,12 @@ async fn allocate_eip(
         &serde_json::json!({
             "AddressCount": 1,
             "InternetChargeType": "BANDWIDTH_PACKAGE",
-            "Tags": [{"TagKey": "hive-project", "TagValue": project}],
+            // Tencent's VPC `Tag` struct is `{Key, Value}`; the `TagKey`/`TagValue`
+            // spelling belongs to the *filter* type and is rejected by
+            // AllocateAddresses with `UnknownParameter: Tags.0.TagKey`
+            // (witnessed live, 2026-09-01) — which failed every dedicated-IPv4
+            // provision before a single address was purchased.
+            "Tags": [{"Key": "hive-project", "Value": project}],
         }),
     )
     .await?;

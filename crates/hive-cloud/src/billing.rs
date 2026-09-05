@@ -8,6 +8,7 @@
 use hive_core::now_ms;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -265,12 +266,40 @@ pub struct Invoice {
     /// "paid" | "due" | "draft"
     pub status: String,
     pub created_ms: u64,
+    /// Tamper-evident commitment over this SAME period's raw ledger entries.
+    /// `Some` only once `account()`'s rollover computed one — never on a
+    /// "draft" invoice from `current_invoice`. `#[serde(default)]` so
+    /// pre-existing persisted invoices load with `None`.
+    #[serde(default)]
+    pub ledger_checkpoint: Option<LedgerCheckpoint>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InvoiceLine {
     pub description: String,
     pub amount_cents: i64,
+}
+
+/// Tamper-evident commitment over one tenant-period's raw `LedgerEntry` rows.
+/// NOT a zk-SNARK/STARK: there is no external, untrusted verifier for this
+/// platform's own billing process to convince, so this is a plain SHA-256
+/// hash chain giving tamper-evidence and fast replay verification, not real
+/// zero-knowledge trust-minimization. See `BillingStore::compute_ledger_checkpoint`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct LedgerCheckpoint {
+    pub tenant: String,
+    pub period_start_ms: u64,
+    pub period_end_ms: u64,
+    /// Number of raw `LedgerEntry` rows folded into `commitment` — a fast
+    /// "does this still look complete" check without re-hashing.
+    pub entry_count: u64,
+    /// hex(SHA-256) chain root over every entry in
+    /// `[period_start_ms, period_end_ms)`, ordered `(ts_ms, id)` ASC.
+    pub commitment: String,
+    /// True once the raw entries this commitment covers have actually been
+    /// pruned from both the in-memory ledger and `billing_ledger`.
+    pub pruned: bool,
+    pub created_ms: u64,
 }
 
 /// Max function runtime (seconds) allowed on a plan. Enterprise unlocks 1 hour.
@@ -439,6 +468,11 @@ pub struct Checkout {
     /// unauthenticated client's say-so that they paid.
     #[serde(default)]
     pub stripe_session_id: String,
+    /// A server-verified THEO transaction hash. Presence means this checkout
+    /// has already been consumed and lets a client safely retry confirmation
+    /// without applying credits or fulfillment a second time.
+    #[serde(default)]
+    pub theo_transaction_hash: String,
     pub created_ms: u64,
 }
 
@@ -486,6 +520,7 @@ pub struct BillingStore {
     accounts: RwLock<HashMap<String, BillingAccount>>,
     ledger: RwLock<Vec<LedgerEntry>>,
     checkouts: RwLock<HashMap<String, Checkout>>,
+    confirmed_theo_checkouts: RwLock<HashMap<String, Checkout>>,
     meters: RwLock<HashMap<String, MeterState>>,
     invoices: RwLock<HashMap<String, Vec<Invoice>>>,
     /// Set when this process restored a snapshot that carried NO meters field
@@ -533,11 +568,17 @@ impl BillingStore {
             // control-plane leader once account() started being called more
             // frequently (relational mirror loop, one call per tenant per
             // tick) raised the odds of landing on a tenant mid-rollover.
-            let closing = build_invoice(
+            let mut closing = build_invoice(
                 acc,
                 self.usage_cost_cents_since(tenant, acc.period_start_ms),
                 "paid",
             );
+            // Compute the checkpoint from the OLD period_start_ms, before it's
+            // overwritten below. compute_ledger_checkpoint touches only
+            // `self.ledger` (never `self.accounts`), same locking-safety rule
+            // as `usage_cost_cents_since` above — `m` is still held here.
+            closing.ledger_checkpoint =
+                Some(self.compute_ledger_checkpoint(tenant, acc.period_start_ms, now));
             acc.period_start_ms = now;
             acc.period_end_ms = now + MONTH_MS;
             acc.used_cents = 0;
@@ -607,6 +648,112 @@ impl BillingStore {
             .filter(|e| e.tenant == tenant && e.kind == "usage" && e.ts_ms >= period_start_ms)
             .map(|e| -e.amount_cents) // usage entries are negative amounts
             .sum()
+    }
+
+    /// Compute (never mutates) a tamper-evident SHA-256 hash-chain commitment
+    /// over a tenant's raw ledger entries in `[period_start_ms, period_end_ms)`.
+    /// Touches only `self.ledger` — safe to call while the caller holds
+    /// `self.accounts`'s write lock, same rule as `usage_cost_cents_since`.
+    ///
+    /// Entries are sorted `(ts_ms, id)` ASC before chaining: `self.ledger` is
+    /// push-appended across all tenants concurrently, not itself ordered per
+    /// tenant, so the chain must be computed over a deterministic order or two
+    /// computations of the "same" period would disagree. `0x1F` (ASCII unit
+    /// separator) delimits fields to avoid ambiguous concatenation without a
+    /// canonicalized encoding. The genesis hash is domain-separated by a
+    /// version string + tenant + period start so two tenants'/periods' empty
+    /// chains never collide, and leaves a `v2` escape hatch if this leaf
+    /// encoding ever changes.
+    pub(crate) fn compute_ledger_checkpoint(
+        &self,
+        tenant: &str,
+        period_start_ms: u64,
+        period_end_ms: u64,
+    ) -> LedgerCheckpoint {
+        const SEP: u8 = 0x1F;
+        let mut entries: Vec<LedgerEntry> = self
+            .ledger
+            .read()
+            .iter()
+            .filter(|e| e.tenant == tenant && e.ts_ms >= period_start_ms && e.ts_ms < period_end_ms)
+            .cloned()
+            .collect();
+        entries.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then_with(|| a.id.cmp(&b.id)));
+
+        let mut chain = Sha256::new();
+        chain.update(b"hive-billing-ledger-checkpoint-v1");
+        chain.update([SEP]);
+        chain.update(tenant.as_bytes());
+        chain.update([SEP]);
+        chain.update(period_start_ms.to_string().as_bytes());
+        let mut chain = chain.finalize();
+
+        for e in &entries {
+            let mut leaf = Sha256::new();
+            leaf.update(e.id.as_bytes());
+            leaf.update([SEP]);
+            leaf.update(e.tenant.as_bytes());
+            leaf.update([SEP]);
+            leaf.update(e.ts_ms.to_string().as_bytes());
+            leaf.update([SEP]);
+            leaf.update(e.kind.as_bytes());
+            leaf.update([SEP]);
+            leaf.update(e.amount_cents.to_string().as_bytes());
+            leaf.update([SEP]);
+            leaf.update(e.balance_after_cents.to_string().as_bytes());
+            leaf.update([SEP]);
+            leaf.update(e.note.as_bytes());
+            let leaf = leaf.finalize();
+
+            let mut next = Sha256::new();
+            next.update(chain);
+            next.update([SEP]);
+            next.update(leaf);
+            chain = next.finalize();
+        }
+
+        LedgerCheckpoint {
+            tenant: tenant.to_string(),
+            period_start_ms,
+            period_end_ms,
+            entry_count: entries.len() as u64,
+            commitment: hex::encode(chain),
+            pruned: false,
+            created_ms: now_ms(),
+        }
+    }
+
+    /// Remove raw entries for tenant/period from the IN-MEMORY ledger only —
+    /// the relational side is pruned separately via
+    /// `relational::prune_billing_ledger`. Returns the count removed.
+    pub(crate) fn prune_ledger_range(
+        &self,
+        tenant: &str,
+        period_start_ms: u64,
+        period_end_ms: u64,
+    ) -> usize {
+        let mut g = self.ledger.write();
+        let before = g.len();
+        g.retain(|e| {
+            !(e.tenant == tenant && e.ts_ms >= period_start_ms && e.ts_ms < period_end_ms)
+        });
+        before - g.len()
+    }
+
+    /// Mark the in-memory `Invoice` whose checkpoint covers
+    /// `[period_start_ms, period_end_ms)` as pruned, so a restart's
+    /// `invoices_load` correctly remembers pruned-state without re-attempting
+    /// an already-completed relational delete on every tick.
+    pub(crate) fn mark_checkpoint_pruned(&self, tenant: &str, period_start_ms: u64) {
+        if let Some(invs) = self.invoices.write().get_mut(tenant) {
+            for inv in invs.iter_mut() {
+                if let Some(cp) = inv.ledger_checkpoint.as_mut() {
+                    if cp.period_start_ms == period_start_ms {
+                        cp.pruned = true;
+                    }
+                }
+            }
+        }
     }
 
     /// Record metered compute usage (a fact — always accrues, never rejected). Uses
@@ -989,12 +1136,21 @@ impl BillingStore {
         } else {
             tenant
         };
-        self.checkouts
+        let mut checkouts: Vec<Checkout> = self
+            .checkouts
             .read()
             .values()
             .filter(|c| c.tenant == tenant)
             .cloned()
-            .collect()
+            .collect();
+        checkouts.extend(
+            self.confirmed_theo_checkouts
+                .read()
+                .values()
+                .filter(|c| c.tenant == tenant)
+                .cloned(),
+        );
+        checkouts
     }
 
     pub fn open_checkout(
@@ -1028,6 +1184,7 @@ impl BillingStore {
             sku: sku.to_string(),
             target: target.to_string(),
             stripe_session_id: String::new(),
+            theo_transaction_hash: String::new(),
             created_ms: now_ms(),
         };
         self.checkouts.write().insert(c.id.clone(), c.clone());
@@ -1077,7 +1234,11 @@ impl BillingStore {
     }
 
     pub fn get_checkout(&self, id: &str) -> Option<Checkout> {
-        self.checkouts.read().get(id).cloned()
+        self.checkouts
+            .read()
+            .get(id)
+            .cloned()
+            .or_else(|| self.confirmed_theo_checkouts.read().get(id).cloned())
     }
 
     /// Drop a tenant's billing account entirely (used when its team is deleted),
@@ -1112,6 +1273,52 @@ impl BillingStore {
             _ => self.account(&c.tenant),
         };
         Some((c, acc))
+    }
+
+    /// Atomically consumes an open checkout after the caller verified the
+    /// transfer on-chain. The short retained record makes same-hash retries
+    /// idempotent and rejects a transaction hash used by another checkout.
+    pub fn confirm_theo_checkout(
+        &self,
+        id: &str,
+        transaction_hash: &str,
+    ) -> Result<(Checkout, BillingAccount, bool), &'static str> {
+        if let Some(existing) = self.confirmed_theo_checkouts.read().get(id).cloned() {
+            return if existing
+                .theo_transaction_hash
+                .eq_ignore_ascii_case(transaction_hash)
+            {
+                Ok((existing.clone(), self.account(&existing.tenant), true))
+            } else {
+                Err("checkout already confirmed with a different transaction")
+            };
+        }
+        let checkout = self
+            .checkouts
+            .write()
+            .remove(id)
+            .ok_or("checkout not found")?;
+        if self.confirmed_theo_checkouts.read().values().any(|co| {
+            co.theo_transaction_hash
+                .eq_ignore_ascii_case(transaction_hash)
+        }) {
+            self.checkouts.write().insert(checkout.id.clone(), checkout);
+            return Err("transaction has already been used for another checkout");
+        }
+        let mut checkout = checkout;
+        checkout.theo_transaction_hash = transaction_hash.to_ascii_lowercase();
+        let account = match checkout.kind.as_str() {
+            "credits" => self.add_credits(
+                &checkout.tenant,
+                checkout.amount_cents,
+                "Credit top-up (checkout)",
+            ),
+            _ => self.account(&checkout.tenant),
+        };
+        self.confirmed_theo_checkouts
+            .write()
+            .insert(checkout.id.clone(), checkout.clone());
+        Ok((checkout, account, false))
     }
 
     // --- persistence ---
@@ -1208,6 +1415,13 @@ impl BillingStore {
             .filter(|c| now.saturating_sub(c.created_ms) < CHECKOUT_RETENTION_MS)
             .cloned()
             .collect();
+        v.extend(
+            self.confirmed_theo_checkouts
+                .read()
+                .values()
+                .filter(|c| now.saturating_sub(c.created_ms) < CHECKOUT_RETENTION_MS)
+                .cloned(),
+        );
         v.sort_by(|a, b| a.id.cmp(&b.id));
         v
     }
@@ -1217,11 +1431,20 @@ impl BillingStore {
     /// a build with a different bound) can reload an unbounded set.
     pub fn checkouts_load(&self, checkouts: Vec<Checkout>) {
         let now = now_ms();
-        *self.checkouts.write() = checkouts
+        let mut open = HashMap::new();
+        let mut confirmed = HashMap::new();
+        for checkout in checkouts
             .into_iter()
             .filter(|c| now.saturating_sub(c.created_ms) < CHECKOUT_RETENTION_MS)
-            .map(|c| (c.id.clone(), c))
-            .collect();
+        {
+            if checkout.theo_transaction_hash.is_empty() {
+                open.insert(checkout.id.clone(), checkout);
+            } else {
+                confirmed.insert(checkout.id.clone(), checkout);
+            }
+        }
+        *self.checkouts.write() = open;
+        *self.confirmed_theo_checkouts.write() = confirmed;
     }
 
     /// Finalized invoices across all tenants (for persistence).
@@ -1283,13 +1506,11 @@ fn build_invoice(acc: &BillingAccount, usage_cents: i64, status: &str) -> Invoic
         total_cents: subtotal,
         status: status.to_string(),
         created_ms: now_ms(),
+        // Never set here — drafts (`current_invoice`) must never carry a
+        // checkpoint; the rollover call site in `account()` overwrites this
+        // with a real one for a finalized period.
+        ledger_checkpoint: None,
     }
-}
-
-pub fn stripe_configured() -> bool {
-    std::env::var("STRIPE_SECRET_KEY")
-        .map(|k| !k.is_empty())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1461,7 +1682,7 @@ mod tests {
     fn meter_charges_delta_and_carries_fraction() {
         let s = BillingStore::new();
         s.set_plan("acme", "pro"); // overage plan so balance can go negative
-                                   // First reading: 0.5¢ worth (below a whole cent) → nothing charged yet.
+        // First reading: 0.5¢ worth (below a whole cent) → nothing charged yet.
         let half = UsageTotals {
             active_cpu_ms: (3_600_000.0 * 0.5 / 12.8) as u64,
             ..Default::default()
@@ -1476,10 +1697,11 @@ mod tests {
         let c2 = s.meter_usage("acme", onefive);
         assert!(c2 >= 1, "should charge the crossed whole cent, got {c2}");
         // The usage is recorded in the ledger as a negative "usage" entry.
-        assert!(s
-            .ledger("acme")
-            .iter()
-            .any(|e| e.kind == "usage" && e.amount_cents < 0));
+        assert!(
+            s.ledger("acme")
+                .iter()
+                .any(|e| e.kind == "usage" && e.amount_cents < 0)
+        );
     }
 
     #[test]
@@ -1533,14 +1755,16 @@ mod tests {
         s.meter_usage("acme", u);
         let inv = s.current_invoice("acme");
         assert_eq!(inv.status, "draft");
-        assert!(inv
-            .lines
-            .iter()
-            .any(|l| l.description.contains("subscription")));
-        assert!(inv
-            .lines
-            .iter()
-            .any(|l| l.description.contains("Compute usage")));
+        assert!(
+            inv.lines
+                .iter()
+                .any(|l| l.description.contains("subscription"))
+        );
+        assert!(
+            inv.lines
+                .iter()
+                .any(|l| l.description.contains("Compute usage"))
+        );
         // Pro subscription is $20 = 2000¢; total is subtotal of all lines.
         assert!(inv.total_cents >= 2000);
     }
@@ -1561,119 +1785,6 @@ mod tests {
         assert!(!plan_spec("hobby").overage);
         assert!(plan_spec("pro").overage);
     }
-}
-
-/// Create a real Stripe Checkout Session (best-effort). `price_id` is `Some` for
-/// a plan upgrade — a REAL recurring subscription against that Stripe Price
-/// (`mode=subscription`); `None` for a one-time purchase (credit top-ups —
-/// `mode=payment` with ad-hoc `price_data`, since there's no fixed Price object
-/// for an arbitrary top-up amount). `checkout_id` is OUR internal `Checkout.id`,
-/// stamped into the session's `metadata` so the webhook handler (which only
-/// ever hears from Stripe, never from our own client) can find the matching
-/// local record. Returns `(hosted_checkout_url, stripe_session_id)` — the
-/// session id is stored via `BillingStore::attach_stripe_session` so
-/// `billing_confirm` can later verify real payment before applying anything.
-pub async fn stripe_checkout(
-    http: &reqwest::Client,
-    price_id: Option<&str>,
-    amount_cents: u64,
-    product_name: &str,
-    success_url: &str,
-    cancel_url: &str,
-    checkout_id: &str,
-) -> anyhow::Result<(String, String)> {
-    let key = std::env::var("STRIPE_SECRET_KEY")?;
-    let mut params: Vec<(String, String)> = vec![
-        ("success_url".into(), success_url.to_string()),
-        ("cancel_url".into(), cancel_url.to_string()),
-        ("metadata[checkout_id]".into(), checkout_id.to_string()),
-        ("line_items[0][quantity]".into(), "1".into()),
-    ];
-    match price_id {
-        Some(pid) => {
-            params.push(("mode".into(), "subscription".into()));
-            params.push(("line_items[0][price]".into(), pid.to_string()));
-            // Subscriptions need the metadata on the SUBSCRIPTION object too
-            // (not just the checkout session) — that's what the
-            // `customer.subscription.*` webhooks carry, and the session's own
-            // metadata isn't copied onto it automatically.
-            params.push((
-                "subscription_data[metadata][checkout_id]".into(),
-                checkout_id.to_string(),
-            ));
-        }
-        None => {
-            params.push(("mode".into(), "payment".into()));
-            params.push(("line_items[0][price_data][currency]".into(), "usd".into()));
-            params.push((
-                "line_items[0][price_data][unit_amount]".into(),
-                amount_cents.to_string(),
-            ));
-            params.push((
-                "line_items[0][price_data][product_data][name]".into(),
-                product_name.to_string(),
-            ));
-        }
-    }
-    let resp = http
-        .post("https://api.stripe.com/v1/checkout/sessions")
-        .basic_auth(&key, Some(""))
-        .form(&params)
-        .send()
-        .await?;
-    let v: serde_json::Value = resp.json().await?;
-    let url = v
-        .get("url")
-        .and_then(|u| u.as_str())
-        .ok_or_else(|| anyhow::anyhow!("stripe: no checkout url ({v})"))?;
-    let session_id = v
-        .get("id")
-        .and_then(|u| u.as_str())
-        .ok_or_else(|| anyhow::anyhow!("stripe: no session id ({v})"))?;
-    Ok((url.to_string(), session_id.to_string()))
-}
-
-/// Real payment/subscription status of a Stripe Checkout Session, fetched
-/// directly from Stripe. `paid` is true when the session actually completed
-/// (`payment_status == "paid"` for a one-time charge, or `status ==
-/// "complete"` for a $0-due-now subscription setup) — this is the
-/// authoritative check `billing_confirm` uses instead of trusting an
-/// unauthenticated client's redirect-back as proof of payment.
-pub struct StripeSessionStatus {
-    pub paid: bool,
-    pub customer: Option<String>,
-    pub subscription: Option<String>,
-}
-
-pub async fn stripe_verify_session(
-    http: &reqwest::Client,
-    session_id: &str,
-) -> anyhow::Result<StripeSessionStatus> {
-    let key = std::env::var("STRIPE_SECRET_KEY")?;
-    let resp = http
-        .get(format!(
-            "https://api.stripe.com/v1/checkout/sessions/{session_id}"
-        ))
-        .basic_auth(&key, Some(""))
-        .send()
-        .await?;
-    let v: serde_json::Value = resp.json().await?;
-    if v.get("error").is_some() {
-        anyhow::bail!("stripe: session lookup failed ({v})");
-    }
-    let paid = v.get("payment_status").and_then(|s| s.as_str()) == Some("paid")
-        || v.get("status").and_then(|s| s.as_str()) == Some("complete");
-    Ok(StripeSessionStatus {
-        paid,
-        customer: v
-            .get("customer")
-            .and_then(|c| c.as_str())
-            .map(|s| s.to_string()),
-        subscription: v
-            .get("subscription")
-            .and_then(|c| c.as_str())
-            .map(|s| s.to_string()),
-    })
 }
 
 /// Verify a Stripe webhook delivery's `Stripe-Signature` header

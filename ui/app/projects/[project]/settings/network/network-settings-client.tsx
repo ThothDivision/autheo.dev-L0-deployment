@@ -43,7 +43,7 @@ export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
   // The purchase record (survives across redeploys) — separate from the
   // deployment-stamped `dedicated_ipv4` below, which only appears once a
   // deploy AFTER purchase actually attaches the address. Polled so a return
-  // from Stripe checkout (or the webhook completing) reflects here with no
+  // from a completed wallet-signed THEO checkout reflects here with no
   // manual refresh.
   const { data: pSettings, refresh: refreshSettings } = usePoll<ProjectSettings>(
     `/v1/projects/${encodeURIComponent(project)}/settings`,
@@ -70,6 +70,10 @@ export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
     if (!dep || dep.id === seededFor || dirty) return;
     // Seed the editor from the stamped raw bindings (the only per-port shape
     // the deployment list carries). An HTTP-only deployment starts empty.
+    // Subscription-sync: re-seeds local editable state from the polled
+    // `deps` external source, gated on identity + dirty so it never clobbers
+    // an in-progress edit — the legitimate "sync from external system" case.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- subscription-sync from usePoll, gated on identity+dirty to never clobber in-progress edits
     setRows(
       (dep.raw_ports ?? []).map((b) => ({
         container_port: String(b.container_port),

@@ -17,6 +17,7 @@ import {
   ChevronRight,
   Activity,
   Loader2,
+  ShieldCheck,
 } from "lucide-react";
 import dynamic from "next/dynamic";
 import { Card, Button, Badge, Triangle, Table, Th, Td } from "@/components/ui";
@@ -26,6 +27,8 @@ import { DeploymentRowMenu } from "@/components/deployment-menu";
 import { RedeployModal } from "@/components/redeploy-modal";
 import { CreateDeploymentModal } from "@/components/create-deployment-modal";
 import { AttachedDomains } from "@/components/attached-domains";
+import { MarketplaceDeploymentModal } from "@/components/marketplace-deployment-modal";
+import { MarketplaceProjectResources } from "@/components/marketplace-project-resources";
 
 // Lazy-load the React Flow service graph — it's a heavy client bundle, so it's
 // only fetched when the Service Graph tab is actually opened.
@@ -83,6 +86,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
   // The deployment whose Redeploy modal is open (null = closed).
   const [redeployFor, setRedeployFor] = useState<Deployment | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [marketplaceOpen, setMarketplaceOpen] = useState(false);
   // A redeploy doesn't create a deployment row until its build FINISHES (the live
   // version keeps serving meanwhile). The in-flight "Building" rows come from a
   // PERSISTENT store (localStorage) so they survive navigating away + reload — the
@@ -185,6 +189,9 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
           </div>
         </div>
         <div className="flex gap-2">
+          <Button variant="outline" onClick={() => setMarketplaceOpen(true)}>
+            <ShieldCheck className="h-4 w-4" /> Marketplace
+          </Button>
           <Button variant="outline" onClick={() => prod && setRedeployFor(prod)} disabled={!prod?.git}>
             {busy === "redeploy" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Redeploy
           </Button>
@@ -225,14 +232,21 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
            segmented control replaces the old ?wf= sub-tabs). */
         <WfConsoleFrame project={name} />
       ) : tab === "resources" ? (
-        <DeploymentResources deploymentId={prod?.id} />
+        <>
+          <MarketplaceProjectResources project={name} />
+          <DeploymentResources deploymentId={prod?.id} />
+        </>
       ) : tab === "overview" ? (
         <>
+          <MarketplaceProjectResources project={name} />
           {/* Production Deployment */}
           <Card className="mb-6 p-0">
             <div className="flex items-center justify-between border-b border-border px-5 py-3">
               <span className="font-medium">Production Deployment</span>
               <div className="flex gap-2">
+                <Button variant="outline" onClick={() => setMarketplaceOpen(true)}>
+                  <ShieldCheck className="h-4 w-4" /> Marketplace
+                </Button>
                 <Button variant="outline" onClick={() => prod && setRedeployFor(prod)} disabled={!prod?.git}>
                   <RefreshCw className="h-4 w-4" /> Redeploy
                 </Button>
@@ -339,6 +353,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
           <span className="text-sm text-secondary">{mine.length + pendingRows.length} deployment{mine.length + pendingRows.length === 1 ? "" : "s"}</span>
           <div className="flex gap-2">
             <Button onClick={() => setCreateOpen(true)}><Plus className="h-4 w-4" /> New Deployment</Button>
+            <Button variant="outline" onClick={() => setMarketplaceOpen(true)}><ShieldCheck className="h-4 w-4" /> Marketplace</Button>
           </div>
         </div>
         <Table>
@@ -471,6 +486,16 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
           }}
         />
       )}
+      {marketplaceOpen && (
+        <MarketplaceDeploymentModal
+          project={name}
+          onClose={() => setMarketplaceOpen(false)}
+          onDone={() => {
+            setTab("deployments");
+            refresh();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -499,16 +524,28 @@ function DeploymentPreview({ project, prod }: { project: string; prod: Deploymen
   const [pv, setPv] = useState<Preview | null>(null);
   const [imgError, setImgError] = useState(false);
 
-  useEffect(() => {
-    let stop = false;
+  // Reset when the deployment identity changes — adjusted during render
+  // (React's "adjusting state when a prop changes" pattern) instead of an
+  // effect, so the stale preview/image-error never flashes before the fetch
+  // below replaces it.
+  const identity = `${project}:${prod?.id ?? ""}`;
+  const [prevIdentity, setPrevIdentity] = useState(identity);
+  if (identity !== prevIdentity) {
+    setPrevIdentity(identity);
     setImgError(false);
     setPv(null);
+  }
+
+  useEffect(() => {
+    let stop = false;
     if (!prod) return;
+    // Fetch-on-mount/identity-change: setPv is called only after the awaited
+    // request resolves, syncing external (server) preview data into React.
     apiGet<Preview>(`/v1/projects/${encodeURIComponent(project)}/preview`)
       .then((d) => { if (!stop) setPv(d); })
       .catch(() => { if (!stop) setPv({ kind: "none" }); });
     return () => { stop = true; };
-  }, [project, prod?.id]);
+  }, [project, prod]);
 
   const box = "relative h-56 overflow-hidden rounded-lg border border-border";
 

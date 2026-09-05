@@ -4,22 +4,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
+    Json, Router,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{delete, get, patch, post, put},
-    Json, Router,
 };
 use base64::Engine;
 use fluid_gateway::{RumDevice, RumRaw};
-use hive_core::{now_ms, BuildJob, JobState, ResourceSpec};
+use hive_core::{BuildJob, JobState, ResourceSpec, now_ms};
 use hive_edge::{
+    CronJob, WorkflowDef,
     bot::BotPolicy,
     routing::{Redirect, Rewrite},
     waf::WafRule,
-    CronJob, WorkflowDef,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::Command;
 
 use crate::state::CloudState;
@@ -53,6 +53,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/gpu-pools", get(gpu_pools))
         .route("/v1/inference", get(inference_endpoints))
         .route("/v1/dns/stats", get(dns_stats))
+        .route("/v1/host/listeners", get(host_listeners))
         .route("/v1/mesh/discovery", get(mesh_discovery))
         .route("/v1/node/restarts", get(node_restarts))
         .route("/v1/mesh/health-guard", get(mesh_health_guard))
@@ -112,6 +113,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/deployments/:id", delete(dep_delete))
         .route("/v1/deployments/:id/resources", get(deployment_resources))
         .route("/v1/deployments/:id/build", get(deployment_build))
+        .route("/v1/deployments/:id/integrity", get(deployment_integrity))
         .route(
             "/v1/deployments/:id/service-graph",
             get(deployment_service_graph),
@@ -320,6 +322,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         // ---- Owner / ops dashboard ----
         .route("/v1/admin/overview", get(admin_overview))
         .route("/v1/admin/audit", get(admin_audit))
+        .route(
+            "/v1/admin/marketplace",
+            get(crate::marketplace::operator_view),
+        )
         .route("/v1/admin/data", get(data_collections))
         .route(
             "/v1/admin/data/:collection",
@@ -340,12 +346,21 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/billing/invoices", get(billing_invoices))
         .route("/v1/billing/checkout", post(billing_checkout))
         .route("/v1/billing/addons", get(billing_addons))
+        .route("/v1/billing/wallet-config", get(billing_wallet_config))
         .route("/v1/billing/checkout/:id", get(billing_checkout_get))
+        .route(
+            "/v1/billing/checkout/:id/payment-intent",
+            post(billing_payment_intent),
+        )
         .route("/v1/billing/confirm", post(billing_confirm))
-        .route("/v1/billing/charge", post(billing_charge))
         .route("/v1/billing/webhook", post(billing_webhook))
+        .route("/v1/billing/charge", post(billing_charge))
         .route("/v1/admin/billing/grant", post(billing_grant))
         .route("/v1/admin/billing/backfill", post(billing_backfill_run))
+        .route(
+            "/v1/admin/projects/:project/team",
+            post(admin_set_project_team),
+        )
         // ---- Deployment preview / thumbnail ----
         .route("/v1/projects/:project/preview", get(project_preview))
         .route("/v1/projects/:project/thumbnail", get(project_thumbnail))
@@ -1067,7 +1082,9 @@ pub(crate) async fn project_network_put(
             }
             return Err((
                 StatusCode::BAD_GATEWAY,
-                format!("project '{project}' is hosted on node '{node}' but the network-edit forward failed"),
+                format!(
+                    "project '{project}' is hosted on node '{node}' but the network-edit forward failed"
+                ),
             ));
         }
         return Err((
@@ -1425,7 +1442,9 @@ async fn activate_domain_alias(
     }
     Err((
         StatusCode::BAD_GATEWAY,
-        format!("project '{project}' is hosted on node '{node}' but the domain activation forward failed"),
+        format!(
+            "project '{project}' is hosted on node '{node}' but the domain activation forward failed"
+        ),
     ))
 }
 
@@ -1949,7 +1968,7 @@ pub fn spawn_domain_verify_loop(cloud: Arc<CloudState>) {
 /// Body-carrying POST forward to a specific node's admin surface — the POST
 /// counterpart of `put_to_host` (PUT), same node_admins-then-iroh-mesh
 /// fallback shape.
-async fn post_to_host_json(
+pub(crate) async fn post_to_host_json(
     c: &Arc<CloudState>,
     node: &str,
     path: &str,
@@ -1974,7 +1993,7 @@ async fn post_to_host_json(
             }
         }
         if crate::auth::enforced() {
-            if let Ok(token) = crate::auth::issue("mesh-internal", team, "service", false, 60) {
+            if let Ok(token) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
                 request = request.bearer_auth(token);
             }
         }
@@ -3150,6 +3169,7 @@ pub(crate) async fn deploy_zip(
         image_pids: None,
         image_ports: None,
         git_token: None, // zip upload has no git clone
+        marketplace_placement: None,
     };
     start_named_deploy(&c, &t, req, None).await
 }
@@ -3252,6 +3272,7 @@ pub(crate) async fn deploy_image(
         image_pids: body.pids,
         image_ports: body.ports,
         git_token: None, // prebuilt image deploy has no git clone
+        marketplace_placement: None,
     };
     start_named_deploy(&c, &t, req, None).await
 }
@@ -3448,6 +3469,54 @@ pub(crate) async fn deployment_build(
     Err(StatusCode::NOT_FOUND)
 }
 
+/// A deployment's tamper-EVIDENCE chain (`hive_core::integrity`) — build
+/// acceptance, publish, and execution facts, each entry's fold hashed into
+/// `chain_head_sha256`, the whole chain signed by this node's per-node key
+/// (`integrity_signer.rs`). A caller re-derives `chain_head_sha256` from
+/// `chain` with `hive_core::fold_integrity_chain` and checks the signature
+/// against `public_key_hex` — no trust in this response beyond the raw
+/// bytes returned. See `hive_core::integrity`'s module doc for exactly what
+/// this does and does not prove (tamper-evidence, never tamper-prevention).
+pub(crate) async fn deployment_integrity(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if let Some(acceptance) = c.deployment_ledger.acceptance(&id) {
+        let team_ok = norm(&c.projects.team_of(&acceptance.input.project)) == norm(&t)
+            || norm(&record_tenant(&acceptance.input.project)) == norm(&t);
+        if !team_ok {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let chain_head_sha256 =
+            hive_core::fold_integrity_chain(&id, &acceptance.integrity_chain);
+        let signature = c.integrity_signer.sign_chain_head(&chain_head_sha256);
+        let sep_public_keys: Vec<&hive_core::IntegrityEntryKind> = acceptance
+            .integrity_chain
+            .iter()
+            .map(|e| &e.kind)
+            .filter(|k| matches!(k, hive_core::IntegrityEntryKind::SepKeyProvisioned { .. }))
+            .collect();
+        return Ok(Json(json!({
+            "deployment_id": id,
+            "chain": acceptance.integrity_chain,
+            "chain_head_sha256": chain_head_sha256,
+            "signatures": [signature],
+            "sep_public_keys": sep_public_keys,
+        })));
+    }
+    if let Some(node) = host_node_for_deployment(&c, &id) {
+        if let Some(v) =
+            fetch_from_host(&c, &node, &format!("/v1/deployments/{id}/integrity"), &t).await
+        {
+            return Ok(Json(v));
+        }
+    }
+    Err(StatusCode::NOT_FOUND)
+}
+
 /// Publish the host subdomains this node serves + its gateway URL, so peers can
 /// build their cross-node routing tables (the mesh routes requests to wherever a
 /// deployment actually lives).
@@ -3508,6 +3577,43 @@ async fn resources_get(
             "city": n.city, "country": n.country, "healthy": n.healthy,
         })).collect::<Vec<_>>(),
     })))
+}
+
+#[derive(Deserialize)]
+struct SetProjectTeamReq {
+    team: String,
+}
+
+/// Operator-only repair for a project stuck at `__untagged__` (created before
+/// tenancy tagging existed, or a tag write that never landed) — real,
+/// witnessed failure mode: `mien-kamp` had zero deployments, zero relational
+/// rows, and settings.team == "__untagged__", so EVERY ownership check in the
+/// platform (the coordinator's own `authorized` gate in `project_delete`, and
+/// the peer-side gossip cascade's `owns_settings`/`owns_deploys`/
+/// `owns_relational` in `gossip.rs`) correctly refused every tenant,
+/// including the platform owner's own "personal" tenant — an untagged
+/// project the owner created is otherwise permanently undeletable, since
+/// `norm("__untagged__")` is NOT the empty-string case `norm()` maps to
+/// "personal". `spawn_tenancy_reconcile` only ever ADDS a tag when it can
+/// infer one from a deployment/relational record — a project with neither
+/// has nothing to infer from and stays untagged forever without a manual
+/// fix. Mirrors `ProjectStore::set_team`'s existing local-write +
+/// fleet-relational-mirror behavior exactly; this endpoint is just the
+/// missing operator-facing door to it.
+async fn admin_set_project_team(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+    Json(body): Json<SetProjectTeamReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let team = body.team.trim();
+    if team.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "team must not be empty".into()));
+    }
+    c.projects.set_team(&project, team);
+    crate::persist::persist(&c);
+    Ok(Json(json!({ "project": project, "team": team })))
 }
 
 /// Serve a build-cache blob to mesh peers (the P2P side of the build cache).
@@ -3672,11 +3778,7 @@ fn api_key_team(c: &Arc<CloudState>, h: &HeaderMap) -> Option<String> {
 
 /// Normalize an owner slug: empty/absent => "personal".
 pub(crate) fn norm(team: &str) -> &str {
-    if team.is_empty() {
-        "personal"
-    } else {
-        team
-    }
+    if team.is_empty() { "personal" } else { team }
 }
 
 /// Multi-tenant ownership guard: resolve the caller's tenant and verify it owns
@@ -3910,6 +4012,34 @@ pub(crate) fn require_auth_read(
     } else {
         Err((StatusCode::UNAUTHORIZED, "sign-in required".into()))
     }
+}
+
+/// Like [`require_auth_read`], but also honors the internal node-to-node
+/// forward trust (`x-hive-internal` == `HIVE_INTERNAL_TOKEN`, constant-time
+/// compare — the same trust `require_operator_or_internal` grants). Needed by
+/// handlers a peer node probes for its OWN infra facts (not tenant data) on a
+/// caller's behalf, e.g. `billing_addons`'s leader-preflight forward — that
+/// hop carries no bearer token and must not require one to answer a
+/// node-local capability check.
+pub(crate) fn require_auth_read_or_internal(
+    headers: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+) -> Result<(), (StatusCode, String)> {
+    if require_auth_read(claims).is_ok() {
+        return Ok(());
+    }
+    if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
+        if !t.trim().is_empty()
+            && headers
+                .get("x-hive-internal")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| ct_eq(v, &t))
+                .unwrap_or(false)
+        {
+            return Ok(());
+        }
+    }
+    Err((StatusCode::UNAUTHORIZED, "sign-in required".into()))
 }
 
 /// Public ingress region code for a region — the `<dep>.<code>.ngrok.pizza` label
@@ -5530,13 +5660,26 @@ async fn project_delete(
             // 30s — an answer slower than that reads as failure even when the
             // cascade later succeeds. Peers the quick pass could not reach get the
             // full retry budget DETACHED below.
+            //
+            // 28s, not the old 20s: `dispatch_project_delete_with`'s own worst
+            // case chains HTTP-capabilities + HTTP-delete + mesh-capabilities +
+            // mesh-delete (the last kept intentionally generous for discovery
+            // fallback, see its own comment) — even after trimming the other
+            // three legs, that sum is ~31s, so a 20s outer cap could kill the
+            // future before it ever reached the mesh fallback it exists to
+            // provide. Witnessed live: a real project delete failed with
+            // "accepted == 0 across all 23 peers" on every attempt, because
+            // every peer with real-but-imperfect HTTP admin connectivity spent
+            // its entire budget stuck on the HTTP leg. 28s stays under the 30s
+            // proxy ceiling with 2s of margin for the response to actually
+            // return.
             let results: Vec<bool> = futures::future::join_all(peers.iter().map(|node| {
                 let c = c.clone();
                 let project = project.clone();
                 let t = t.clone();
                 async move {
                     tokio::time::timeout(
-                        std::time::Duration::from_secs(20),
+                        std::time::Duration::from_secs(28),
                         dispatch_project_delete_with(&c, node, &project, &t, delete_ms, 1),
                     )
                     .await
@@ -5794,11 +5937,24 @@ pub(crate) async fn dispatch_project_delete_with(
         // await (the spawned cascade future must be `Send`).
         let admin = c.node_admins.read().get(node).cloned();
         if let Some(admin) = &admin {
+            // Budgeted, not the old flat 5s/15s/10s/20s: this whole function
+            // runs inside the caller's own 20s-per-peer timeout (team_delete's
+            // quick pass), and unlike a single-shot call this one chains FOUR
+            // network round trips in the worst case (HTTP capabilities, HTTP
+            // delete, mesh capabilities, mesh delete) when the HTTP path is
+            // slow-but-not-dead rather than cleanly absent. The old
+            // 5+15+10+20=50s sum could never fit the 20s budget, so a peer
+            // with imperfect-but-real HTTP admin connectivity burned its
+            // ENTIRE budget on the HTTP leg and never reached the mesh
+            // fallback the function is written to fall back to — exactly the
+            // "accepted == 0 across all peers" failure witnessed live deleting
+            // a real project. Shrunk so the four-hop worst case (3+5+3+6=17s)
+            // leaves headroom inside the 20s cap.
             if !http_generation_v1 {
                 http_generation_v1 = match c
                     .http
                     .get(format!("{admin}/v1/project-delete/capabilities"))
-                    .timeout(std::time::Duration::from_secs(5))
+                    .timeout(std::time::Duration::from_secs(3))
                     .send()
                     .await
                 {
@@ -5834,13 +5990,13 @@ pub(crate) async fn dispatch_project_delete_with(
                 }
                 if crate::auth::enforced() {
                     if let Ok(token) =
-                        crate::auth::issue("mesh-internal", team, "service", false, 60)
+                        crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS)
                     {
                         request = request.bearer_auth(token);
                     }
                 }
                 match request
-                    .timeout(std::time::Duration::from_secs(15))
+                    .timeout(std::time::Duration::from_secs(5))
                     .send()
                     .await
                 {
@@ -5872,6 +6028,16 @@ pub(crate) async fn dispatch_project_delete_with(
             .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
         if let Some((id, addr)) = target {
             if !mesh_generation_v1 {
+                // 6s, not the 10s original NOR the over-corrected 3s: this is
+                // the ONLY transport ever exercised on a Firecracker fleet
+                // (`node_admins` is empty there, so the HTTP leg above never
+                // runs at all — its own timeouts cost nothing real here).
+                // Measured cross-continent mesh dial latency on this fleet
+                // reaches ~4.3s (lax) on a cold connection, so 3s risked
+                // failing the capabilities probe on real, healthy links
+                // rather than fixing anything — the actual bottleneck this
+                // whole change targets is the DELETE call below, which stays
+                // at its original, deliberately generous timeout.
                 mesh_generation_v1 = crate::gossip::request_to(
                     c,
                     &id,
@@ -5879,7 +6045,7 @@ pub(crate) async fn dispatch_project_delete_with(
                     hive_p2p::GOSSIP_GET,
                     "/v1/project-delete/capabilities",
                     &[],
-                    10,
+                    6,
                 )
                 .await
                 .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
@@ -6637,7 +6803,7 @@ pub(crate) async fn fetch_bytes_from_host(
         .header("x-hive-team", team)
         .timeout(std::time::Duration::from_secs(15));
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, 60) {
+        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
             rb = rb.bearer_auth(tok);
         }
     }
@@ -6659,7 +6825,7 @@ async fn proxy_get_json(c: &Arc<CloudState>, admin: &str, path: &str, team: &str
     // proxied here silently 403'd. Attach the same short-lived signed service
     // delegation `fanout_remote` uses so this node-to-node read authenticates.
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, 60) {
+        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
             rb = rb.bearer_auth(tok);
         }
     }
@@ -6767,7 +6933,7 @@ pub(crate) fn mesh_team_qs(team: &str) -> String {
         return String::new();
     }
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, 60) {
+        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
             return format!("team={team}&tok={tok}");
         }
     }
@@ -6940,6 +7106,7 @@ fn redeploy_request(
         // shape it always did.
         image_ports: None,
         git_token,
+        marketplace_placement: None,
     }
 }
 
@@ -7019,7 +7186,7 @@ async fn project_redeploy(
             );
             let build_id = crate::git::start_build(c.clone(), req, Some(incarnation), None)
                 .await
-                .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+                .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
             return Ok(Json(json!({ "build_id": build_id })));
         }
         if let Some(host) = host_node_for_source_ids(&c, &source_ids) {
@@ -7044,14 +7211,16 @@ async fn project_redeploy(
                         Some(incarnation),
                     )
                     .await
-                    .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+                    .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
                     return Ok(Json(json!({ "build_id": build_id })));
                 }
             }
         }
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!("The uploaded source for '{project}' is not available on a reachable node — re-upload the archive to redeploy."),
+            format!(
+                "The uploaded source for '{project}' is not available on a reachable node — re-upload the archive to redeploy."
+            ),
         ));
     }
 
@@ -7065,7 +7234,9 @@ async fn project_redeploy(
         let Some(image_ref) = image_ref else {
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
-                format!("The image reference for '{project}' is unavailable — redeploy from a new image."),
+                format!(
+                    "The image reference for '{project}' is unavailable — redeploy from a new image."
+                ),
             ));
         };
         let mut req = redeploy_request(
@@ -7084,7 +7255,7 @@ async fn project_redeploy(
         req.image_ref = Some(image_ref);
         let build_id = crate::git::start_build(c.clone(), req, Some(incarnation), None)
             .await
-            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+            .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
         return Ok(Json(json!({ "build_id": build_id })));
     }
 
@@ -7102,7 +7273,7 @@ async fn project_redeploy(
     );
     let build_id = crate::git::start_build(c.clone(), req, Some(incarnation), None)
         .await
-        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+        .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
     Ok(Json(json!({ "build_id": build_id })))
 }
 
@@ -7376,7 +7547,9 @@ async fn git_webhook(
                 .into(),
         ));
     } else {
-        tracing::warn!("accepting UNSIGNED webhook delivery (GITHUB_WEBHOOK_ALLOW_UNSIGNED=1) — re-sign this hook to restore signature verification");
+        tracing::warn!(
+            "accepting UNSIGNED webhook delivery (GITHUB_WEBHOOK_ALLOW_UNSIGNED=1) — re-sign this hook to restore signature verification"
+        );
     }
 
     let event = headers
@@ -7518,7 +7691,9 @@ async fn git_webhook(
     let candidates: Vec<String> = if !c.git_index.is_empty() {
         c.git_index.projects_for(&want)
     } else {
-        tracing::warn!("git_webhook: reverse index is empty/uninitialized — falling back to a full project scan");
+        tracing::warn!(
+            "git_webhook: reverse index is empty/uninitialized — falling back to a full project scan"
+        );
         c.projects.snapshot().into_keys().collect()
     };
 
@@ -7614,6 +7789,7 @@ async fn git_webhook(
             // webhook auto-deploy: GitHub App installation token (first choice,
             // resolved once above) else falls back to node GITHUB_TOKEN in git.rs
             git_token: webhook_git_token.clone(),
+            marketplace_placement: None,
         };
         // Webhook push: not a fanout receiver and no pre-resolved incarnation
         // (`req.project_incarnation` above is `None` too) — `start_build`
@@ -8456,6 +8632,26 @@ async fn heap_profile(
         StatusCode::NOT_IMPLEMENTED,
         "heap profiling is Linux-only".to_string(),
     ))
+}
+
+/// Host listener audit (operator). NODE-LOCAL, exactly like `/v1/dns/stats`:
+/// the report describes the node that answers, so through the dashboard's
+/// `/ops/*` proxy you are reading the LEADER's host, not the page-serving
+/// node's — the fleet view is `scripts/audit-public-listeners.sh`. `last` is
+/// `null` until the first pass (~30 s after boot); `supported: false` means
+/// the host has no `/proc/net/tcp` (macOS), which is "not audited", never
+/// "clean". See `listener_audit`.
+async fn host_listeners(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let range = crate::listener_audit::audited_range();
+    Ok(Json(json!({
+        "node": c.node_name,
+        "range": [range.0, range.1],
+        "last": crate::listener_audit::last(),
+    })))
 }
 
 /// Geo-DNS observability (operator): live Seer query counters, the
@@ -11216,12 +11412,13 @@ async fn apikeys_list(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    Json(json!(c
-        .apikeys
-        .list(&t)
-        .iter()
-        .map(|k| k.public())
-        .collect::<Vec<_>>()))
+    Json(json!(
+        c.apikeys
+            .list(&t)
+            .iter()
+            .map(|k| k.public())
+            .collect::<Vec<_>>()
+    ))
 }
 
 async fn apikey_create(
@@ -11264,12 +11461,13 @@ async fn integrations_list(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    Json(json!(c
-        .integrations
-        .list(&t)
-        .iter()
-        .map(|i| i.public())
-        .collect::<Vec<_>>()))
+    Json(json!(
+        c.integrations
+            .list(&t)
+            .iter()
+            .map(|i| i.public())
+            .collect::<Vec<_>>()
+    ))
 }
 
 async fn integration_upsert(
@@ -12272,7 +12470,7 @@ async fn database_create(
         .filter(|r| !r.is_empty())
         .and_then(|region| {
             let regions = [region.to_string()];
-            crate::schedule::place(&c, &regions, true, true, false, false, false, false)
+            crate::schedule::place(&c, &regions, true, true, false, false, false, false, None)
                 .into_iter()
                 .next()
         })
@@ -12998,7 +13196,7 @@ fn ns(
 /// admin router is bound to the public API host (main.rs), so an arbitrary
 /// internet caller can set `x-hive-mirror`/`x-hive-team` themselves. `x-hive-mirror-tok`
 /// carries a short-lived signed token (minted the same way as `mesh_team_qs`,
-/// `crate::auth::issue("mesh-internal", team, "service", false, 60)`) — only a
+/// `crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS)`) — only a
 /// caller holding `HIVE_JWT_SECRET` can produce one, closing the cross-tenant
 /// write bypass. When JWT enforcement is off (dev/single-node), the raw header
 /// is trusted as before (nothing to forge against). Normal writes resolve the
@@ -13019,7 +13217,9 @@ fn write_scope(
             return match team {
                 Some(team) if !team.is_empty() => (team, true),
                 _ => {
-                    tracing::warn!("mirror write rejected: missing/invalid x-hive-mirror-tok under enforced auth");
+                    tracing::warn!(
+                        "mirror write rejected: missing/invalid x-hive-mirror-tok under enforced auth"
+                    );
                     (tenant(c, h, claims), false)
                 }
             };
@@ -13936,7 +14136,9 @@ async fn forward_mutation_to_leader(
     let Some(admin) = admin else {
         return Err((
             StatusCode::BAD_GATEWAY,
-            format!("this mutation must run on the control-plane leader '{leader}', whose admin URL this node does not know — retry via the leader"),
+            format!(
+                "this mutation must run on the control-plane leader '{leader}', whose admin URL this node does not know — retry via the leader"
+            ),
         ));
     };
     let mut req = c
@@ -15048,7 +15250,6 @@ pub(crate) async fn billing_get(
     Json(json!({
         "account": acc,
         "plans": crate::billing::PLANS,
-        "stripe": crate::billing::stripe_configured(),
         "rate_card": crate::billing::RATE_CARD,
         "limits": {
             "max_projects": crate::billing::plan_max_projects(&plan),
@@ -15143,16 +15344,108 @@ fn default_kind() -> String {
     "plan".into()
 }
 
+/// Public wallet configuration. Every value comes from operator configuration:
+/// this process never holds a wallet secret and cannot sign a customer payment.
+fn theo_network() -> Result<Value, (StatusCode, String)> {
+    let chain_id = std::env::var("THEO_CHAIN_ID")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "THEO_CHAIN_ID is not configured".into(),
+        ))?;
+    let rpc_url = std::env::var("THEO_RPC_URL").unwrap_or_default();
+    let token_address = std::env::var("THEO_TOKEN_ADDRESS").unwrap_or_default();
+    let treasury_address = std::env::var("THEO_TREASURY_ADDRESS").unwrap_or_default();
+    let token_decimals = std::env::var("THEO_TOKEN_DECIMALS")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .filter(|decimals| (2..=36).contains(decimals))
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "THEO_TOKEN_DECIMALS is not configured safely".into(),
+        ))?;
+    let required_confirmations = std::env::var("THEO_REQUIRED_CONFIRMATIONS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|confirmations| *confirmations > 0)
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "THEO_REQUIRED_CONFIRMATIONS is not configured safely".into(),
+        ))?;
+    if !rpc_url.starts_with("https://")
+        || !is_evm_address(&token_address)
+        || !is_evm_address(&treasury_address)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "THEO wallet settlement is not configured safely".into(),
+        ));
+    }
+    Ok(json!({
+        "chain_id": chain_id,
+        "chain_name": std::env::var("THEO_CHAIN_NAME").unwrap_or_else(|_| "Autheo".into()),
+        "rpc_url": rpc_url,
+        "explorer_url": std::env::var("THEO_EXPLORER_URL").unwrap_or_default(),
+        "token_address": token_address,
+        "treasury_address": treasury_address,
+        "token_decimals": token_decimals,
+        "required_confirmations": required_confirmations,
+    }))
+}
+
+fn is_evm_address(value: &str) -> bool {
+    value.len() == 42
+        && value.starts_with("0x")
+        && value[2..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Existing catalog values are hundredths of THEO. Convert only the fixed,
+/// THEO-denominated catalog quantity to ERC-20 atomic units; never consult USD.
+fn checkout_theo_atomic(amount: u64, token_decimals: u8) -> String {
+    (u128::from(amount) * 10u128.pow(u32::from(token_decimals - 2))).to_string()
+}
+
+/// Public, tenant-authenticated wallet parameters. These are operator-owned
+/// configuration values, never browser-provided addresses or token metadata.
+async fn billing_wallet_config(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0)).map_err(|e| (e.0, e.1))?;
+    Ok(Json(theo_network()?))
+}
+
 /// Which purchasable addons this fleet can actually deliver, and when it
 /// cannot, WHY. The dashboard reads this to render a disabled control with the
 /// operator's remedy instead of a Buy button that answers with an HTTP error
 /// only after the user clicks it. Tenant-authed (same read bar as billing).
+///
+/// GETs are served node-local (see `main.rs`'s admin_ingress dispatch doc) —
+/// correct for gossip-replicated tenant state, wrong here: Tencent
+/// credentials are NODE-LOCAL infrastructure config, so different nodes give
+/// genuinely different (not just eventually-consistent) answers. A tenant
+/// landing on a non-Tencent or not-yet-configured node saw "not available"
+/// even on a fleet where the purchase path (leader-forwarded, always a
+/// credentialed node per `HIVE_CP_OWNER_CHAIN`) would have succeeded. On a
+/// local preflight failure, ask the leader's own view before answering
+/// "unavailable" — the leader is always Tencent-credentialed by the same
+/// invariant `provision_from_checkout` already relies on. Fail OPEN toward
+/// the local answer if the leader can't be reached, never hang the endpoint.
 async fn billing_addons(
-    State(_c): State<Arc<CloudState>>,
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth_read(claims.as_ref().map(|e| &e.0)).map_err(|e| (e.0, e.1))?;
-    let (available, reason) = match crate::tencent_eip::preflight() {
+    require_auth_read_or_internal(&headers, claims.as_ref().map(|e| &e.0))
+        .map_err(|e| (e.0, e.1))?;
+    let mut result = crate::tencent_eip::preflight();
+    if result.is_err() && !c.is_control_plane_leader() {
+        if let Some(leader_result) = crate::tencent_eip::leader_preflight(&c).await {
+            result = leader_result;
+        }
+    }
+    let (available, reason) = match result {
         Ok(()) => (true, String::new()),
         Err(why) => (
             false,
@@ -15187,73 +15480,57 @@ async fn billing_checkout(
     // so a sentence here is a sentence in the UI.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let mut target = String::new();
-    let (plan, amount, label, price_id): (String, u64, String, Option<String>) =
-        match req.kind.as_str() {
-            "credits" => {
-                let amt = req.amount_cents.unwrap_or(1000);
-                (
-                    "".to_string(),
-                    amt,
-                    format!("OpenEdge credits (${:.2})", amt as f64 / 100.0),
-                    None,
-                )
+    let (plan, amount): (String, u64) = match req.kind.as_str() {
+        "credits" => {
+            let amt = req.amount_cents.unwrap_or(1000);
+            ("".to_string(), amt)
+        }
+        "addon" => {
+            if req.sku.as_deref() != Some(crate::tencent_eip::SKU) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "unknown addon sku {:?} — the only addon today is {:?}",
+                        req.sku.as_deref().unwrap_or(""),
+                        crate::tencent_eip::SKU
+                    ),
+                ));
             }
-            "addon" => {
-                if req.sku.as_deref() != Some(crate::tencent_eip::SKU) {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "unknown addon sku {:?} — the only addon today is {:?}",
-                            req.sku.as_deref().unwrap_or(""),
-                            crate::tencent_eip::SKU
-                        ),
-                    ));
-                }
-                target = req.target.clone().unwrap_or_default();
-                if target.is_empty() {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        "this addon is purchased for a specific project, but no project was named"
-                            .into(),
-                    ));
-                }
-                if !project_owned_by(&c, &target, norm(&t)) {
-                    return Err((
-                        StatusCode::FORBIDDEN,
-                        format!("project {target:?} is not owned by your team"),
-                    ));
-                }
-                // PREFLIGHT before any checkout record exists: discovering
-                // missing config after confirming a checkout left a confirmed
-                // purchase with no address, and told the buyer nothing.
-                if let Err(why) = crate::tencent_eip::preflight() {
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!(
-                            "Dedicated IPv4 is not available on this fleet yet: {why}. This is an \
+            target = req.target.clone().unwrap_or_default();
+            if target.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "this addon is purchased for a specific project, but no project was named"
+                        .into(),
+                ));
+            }
+            if !project_owned_by(&c, &target, norm(&t)) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("project {target:?} is not owned by your team"),
+                ));
+            }
+            // PREFLIGHT before any checkout record exists: discovering
+            // missing config after confirming a checkout left a confirmed
+            // purchase with no address, and told the buyer nothing.
+            if let Err(why) = crate::tencent_eip::preflight() {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "Dedicated IPv4 is not available on this fleet yet: {why}. This is an \
                              operator setup step (Tencent API credentials, EIP region and the \
                              node's CVM instance id) — nothing was purchased or charged."
-                        ),
-                    ));
-                }
-                (
-                    "".to_string(),
-                    crate::tencent_eip::PRICE_CENTS,
-                    format!("Dedicated IPv4 — {target}"),
-                    crate::tencent_eip::price_id(),
-                )
+                    ),
+                ));
             }
-            _ => {
-                let plan = req.plan.unwrap_or_else(|| "pro".into());
-                let spec = crate::billing::plan_spec(&plan);
-                (
-                    plan,
-                    spec.price_cents,
-                    format!("OpenEdge {} plan", spec.name),
-                    spec.stripe_price_id.map(|s| s.to_string()),
-                )
-            }
-        };
+            ("".to_string(), crate::tencent_eip::PRICE_CENTS)
+        }
+        _ => {
+            let plan = req.plan.unwrap_or_else(|| "pro".into());
+            let spec = crate::billing::plan_spec(&plan);
+            (plan, spec.price_cents)
+        }
+    };
     // A free plan (Hobby, or any future $0 tier) has nothing to charge —
     // Stripe Checkout rejects a $0 payment/subscription outright, and there's
     // no reason to round-trip it at all. Apply immediately, same as the mock
@@ -15270,9 +15547,7 @@ async fn billing_checkout(
             "switched to a free plan (no checkout needed)",
         );
         crate::persist::persist(&c);
-        return Ok(Json(
-            json!({ "url": "", "mock": false, "applied": true, "account": acc }),
-        ));
+        return Ok(Json(json!({ "url": "", "applied": true, "account": acc })));
     }
     // Same $0 shortcut for an addon (currently `tencent_eip::PRICE_CENTS == 0`,
     // an operator-set testing price, never assumed permanent): route through
@@ -15306,7 +15581,7 @@ async fn billing_checkout(
                 );
                 crate::persist::persist(&c);
                 return Ok(Json(
-                    json!({ "url": "", "mock": false, "applied": true, "dedicated_ipv4": alloc }),
+                    json!({ "url": "", "applied": true, "dedicated_ipv4": alloc }),
                 ));
             }
             Err(e) => {
@@ -15327,58 +15602,67 @@ async fn billing_checkout(
         .billing
         .open_checkout_full(&t, &req.kind, &plan, amount, sku, &target);
 
-    // Real Stripe Checkout when configured; otherwise the local mock checkout.
-    if crate::billing::stripe_configured() {
-        let base = std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:3000".into());
-        // An addon purchase is scoped to a project (e.g. dedicated_ipv4) --
-        // land the buyer back where they bought it, not on the unrelated
-        // billing overview page, which has nothing to show for it.
-        let (success, cancel) = if req.kind == "addon" && !target.is_empty() {
-            let enc =
-                percent_encoding::utf8_percent_encode(&target, percent_encoding::NON_ALPHANUMERIC)
-                    .to_string();
-            (
-                format!(
-                    "{base}/projects/{enc}/settings/network?addon_success={}",
-                    co.id
-                ),
-                format!("{base}/projects/{enc}/settings/network?addon_canceled=1"),
-            )
-        } else {
-            (
-                format!("{base}/billing?success={}", co.id),
-                format!("{base}/billing?canceled=1"),
-            )
-        };
-        match crate::billing::stripe_checkout(
-            &c.http,
-            price_id.as_deref(),
-            amount,
-            &label,
-            &success,
-            &cancel,
-            &co.id,
-        )
-        .await
-        {
-            Ok((url, stripe_session_id)) => {
-                c.billing.attach_stripe_session(&co.id, &stripe_session_id);
-                return Ok(Json(json!({ "url": url, "mock": false, "session": co.id })));
-            }
-            Err(e) => tracing::warn!(error=%e, "stripe checkout failed; falling back to mock"),
-        }
+    let network = theo_network()?;
+    let token_decimals = network["token_decimals"].as_u64().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "invalid THEO token decimals".into(),
+    ))? as u8;
+    Ok(Json(json!({
+        "url": format!("/billing/checkout?session={}", co.id),
+        "session": co.id,
+        "amount_theo_atomic": checkout_theo_atomic(amount, token_decimals),
+        "network": network,
+    })))
+}
+
+/// Minting this response does not change a checkout. It is the last
+/// server-verified, tenant-scoped intent fetched before a wallet is asked to
+/// sign, so the client cannot select its own recipient, token, or amount.
+async fn billing_payment_intent(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let co = c
+        .billing
+        .get_checkout(&id)
+        .ok_or((StatusCode::NOT_FOUND, "checkout not found".into()))?;
+    if norm(&co.tenant) != t {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "checkout belongs to another tenant".into(),
+        ));
     }
-    Ok(Json(
-        json!({ "url": format!("/billing/checkout?session={}", co.id), "mock": true, "session": co.id }),
-    ))
+    let network = theo_network()?;
+    let decimals = network["token_decimals"].as_u64().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "invalid THEO token decimals".into(),
+    ))? as u8;
+    Ok(Json(json!({
+        "session": co.id,
+        "amount_theo_atomic": checkout_theo_atomic(co.amount_cents, decimals),
+        "network": network,
+    })))
 }
 
 pub(crate) async fn billing_checkout_get(
     State(c): State<Arc<CloudState>>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, String)> {
     if let Some(co) = c.billing.get_checkout(&id) {
-        return Ok(Json(json!(co)));
+        let network = theo_network()?;
+        let decimals = network["token_decimals"].as_u64().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "invalid THEO token decimals".into(),
+        ))? as u8;
+        return Ok(Json(json!({
+            "id": co.id, "tenant": co.tenant, "kind": co.kind, "plan": co.plan,
+            "sku": co.sku, "target": co.target,
+            "amount_theo_atomic": checkout_theo_atomic(co.amount_cents, decimals),
+            "network": network,
+        })));
     }
     // Checkouts live in an in-process map on whichever node opened them, and
     // `POST /v1/billing/checkout` is a mutation so it always runs on the billing
@@ -15389,12 +15673,134 @@ pub(crate) async fn billing_checkout_get(
     if let Some(v) = proxy_billing_read(&c, &format!("/v1/billing/checkout/{id}"), "").await {
         return Ok(Json(v));
     }
-    Err(StatusCode::NOT_FOUND)
+    Err((StatusCode::NOT_FOUND, "checkout session not found".into()))
 }
 
 #[derive(Deserialize)]
 struct ConfirmReq {
     session: String,
+    wallet: String,
+    transaction_hash: String,
+}
+
+/// Verify the actual on-chain ERC-20 transfer before consuming a checkout.
+/// Wallets sign in-browser; this only reads a configured public RPC and checks
+/// sender, THEO contract, treasury, amount, successful receipt, and chain.
+async fn verify_theo_settlement(
+    http: &reqwest::Client,
+    checkout: &crate::billing::Checkout,
+    wallet: &str,
+    transaction_hash: &str,
+) -> Result<(), String> {
+    if !is_evm_address(wallet)
+        || transaction_hash.len() != 66
+        || !transaction_hash.starts_with("0x")
+        || !transaction_hash[2..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err("invalid wallet or transaction hash".into());
+    }
+    let network = theo_network().map_err(|(_, e)| e)?;
+    let rpc = network["rpc_url"].as_str().ok_or("missing RPC URL")?;
+    let expected_chain = network["chain_id"].as_u64().ok_or("missing chain id")?;
+    let chain = theo_rpc(http, rpc, "eth_chainId", json!([])).await?;
+    let chain = chain
+        .as_str()
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        .ok_or("invalid RPC chain id")?;
+    if chain != expected_chain {
+        return Err("THEO RPC is on the wrong chain".into());
+    }
+    let tx = theo_rpc(
+        http,
+        rpc,
+        "eth_getTransactionByHash",
+        json!([transaction_hash]),
+    )
+    .await?;
+    let receipt = theo_rpc(
+        http,
+        rpc,
+        "eth_getTransactionReceipt",
+        json!([transaction_hash]),
+    )
+    .await?;
+    if tx.is_null() || receipt.is_null() {
+        return Err("THEO transaction is still pending".into());
+    }
+    if receipt.get("status").and_then(Value::as_str) != Some("0x1") {
+        return Err("THEO transaction failed on-chain".into());
+    }
+    let lower = |value: Option<&str>| value.unwrap_or_default().to_ascii_lowercase();
+    if lower(tx.get("from").and_then(Value::as_str)) != wallet.to_ascii_lowercase()
+        || lower(tx.get("to").and_then(Value::as_str)) != lower(network["token_address"].as_str())
+    {
+        return Err("transaction sender or THEO token contract does not match checkout".into());
+    }
+    let input = tx
+        .get("input")
+        .or_else(|| tx.get("data"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let expected_to = lower(network["treasury_address"].as_str())
+        .trim_start_matches("0x")
+        .to_string();
+    let token_decimals = network["token_decimals"]
+        .as_u64()
+        .ok_or("missing token decimals")? as u8;
+    let expected_amount = format!(
+        "{:064x}",
+        checkout_theo_atomic(checkout.amount_cents, token_decimals)
+            .parse::<u128>()
+            .map_err(|_| "invalid checkout amount")?
+    );
+    if input.len() != 138
+        || !input.starts_with("0xa9059cbb")
+        || input[34..74].to_ascii_lowercase() != format!("{expected_to:0>64}")
+        || input[74..].to_ascii_lowercase() != expected_amount
+    {
+        return Err("transaction does not transfer the exact THEO checkout amount".into());
+    }
+    let confirmations = network["required_confirmations"]
+        .as_u64()
+        .ok_or("missing confirmation policy")?;
+    let receipt_block = receipt
+        .get("blockNumber")
+        .and_then(Value::as_str)
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        .ok_or("transaction receipt has no block number")?;
+    let tip = theo_rpc(http, rpc, "eth_blockNumber", json!([]))
+        .await?
+        .as_str()
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        .ok_or("invalid RPC block number")?;
+    if tip.saturating_sub(receipt_block).saturating_add(1) < confirmations {
+        return Err(format!(
+            "THEO transaction is awaiting {confirmations} required confirmations"
+        ));
+    }
+    Ok(())
+}
+
+async fn theo_rpc(
+    http: &reqwest::Client,
+    rpc_url: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let response = http
+        .post(rpc_url)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+        .send()
+        .await
+        .map_err(|_| "THEO RPC unavailable".to_string())?;
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|_| "malformed THEO RPC response".to_string())?;
+    if value.get("error").is_some() {
+        return Err("THEO RPC rejected the request".into());
+    }
+    Ok(value.get("result").cloned().unwrap_or(Value::Null))
 }
 
 async fn billing_confirm(
@@ -15414,27 +15820,24 @@ async fn billing_confirm(
     if norm(&co.tenant) != t {
         return Err(StatusCode::FORBIDDEN);
     }
-    // When this was a REAL Stripe checkout, verify actual payment with Stripe
-    // before applying anything — the client hitting this endpoint (a redirect
-    // back from Stripe, or a direct call) is NOT proof of payment on its own;
-    // without this check, anyone could open a checkout and immediately call
-    // confirm without ever paying, and receive the plan/credits for free.
-    let mut stripe_customer = String::new();
-    let mut stripe_subscription = String::new();
-    if !co.stripe_session_id.is_empty() {
-        let status = crate::billing::stripe_verify_session(&c.http, &co.stripe_session_id)
-            .await
-            .map_err(|e| { tracing::warn!(error=%e, session=%co.stripe_session_id, "stripe session verification failed"); StatusCode::BAD_GATEWAY })?;
-        if !status.paid {
-            return Err(StatusCode::PAYMENT_REQUIRED);
-        }
-        stripe_customer = status.customer.unwrap_or_default();
-        stripe_subscription = status.subscription.unwrap_or_default();
-    }
-    let (co, acc) = c
+    verify_theo_settlement(&c.http, &co, &req.wallet, &req.transaction_hash)
+        .await
+        .map_err(|e| {
+            tracing::warn!(checkout = %co.id, error = %e, "THEO settlement verification failed");
+            StatusCode::PAYMENT_REQUIRED
+        })?;
+    let (co, acc, already_confirmed) = c
         .billing
-        .confirm_checkout(&req.session)
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .confirm_theo_checkout(&req.session, &req.transaction_hash)
+        .map_err(|reason| {
+            tracing::warn!(checkout = %req.session, %reason, "THEO checkout confirmation refused");
+            StatusCode::CONFLICT
+        })?;
+    if already_confirmed {
+        return Ok(Json(
+            json!({ "ok": true, "already_confirmed": true, "account": acc }),
+        ));
+    }
     // `confirm_checkout` only moves the billing half; the effect for a
     // completed "plan"/"addon" checkout is dispatched here — never inside
     // `confirm_checkout` itself, same single-writer split as the "credits"
@@ -15454,10 +15857,6 @@ async fn billing_confirm(
         }
         _ => apply_plan_everywhere(&c, &co.tenant, &co.plan),
     }
-    if !stripe_customer.is_empty() || !stripe_subscription.is_empty() {
-        c.billing
-            .set_stripe_ids(&co.tenant, &stripe_customer, &stripe_subscription);
-    }
     c.audit.record(
         &t,
         "user",
@@ -15465,10 +15864,15 @@ async fn billing_confirm(
         "billing",
         &co.id,
         &format!(
-            "checkout {} {} ${:.2}",
+            "THEO checkout {} {} {} atomic units",
             co.kind,
             co.plan,
-            co.amount_cents as f64 / 100.0
+            checkout_theo_atomic(
+                co.amount_cents,
+                theo_network().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?["token_decimals"]
+                    .as_u64()
+                    .ok_or(StatusCode::SERVICE_UNAVAILABLE)? as u8
+            )
         ),
     );
     crate::persist::persist(&c);
@@ -15497,7 +15901,9 @@ async fn billing_webhook(
 ) -> Result<StatusCode, StatusCode> {
     let secret = std::env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default();
     if secret.is_empty() {
-        tracing::warn!("stripe webhook received but STRIPE_WEBHOOK_SECRET is not configured — rejecting (fail closed)");
+        tracing::warn!(
+            "stripe webhook received but STRIPE_WEBHOOK_SECRET is not configured — rejecting (fail closed)"
+        );
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let sig = headers
@@ -15962,7 +16368,12 @@ async fn data_create(
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     // Don't let custom docs shadow a typed platform collection.
     if all_collections(&c).iter().any(|(n, _)| *n == collection) {
-        return Err((StatusCode::CONFLICT, format!("'{collection}' is a managed collection — create custom docs in a new collection name")));
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "'{collection}' is a managed collection — create custom docs in a new collection name"
+            ),
+        ));
     }
     let doc = c.docs.create(&collection, &t, body);
     c.audit
@@ -16040,7 +16451,7 @@ async fn data_delete(
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!("'{collection}' rows are managed and can't be deleted here"),
-            ))
+            ));
         }
     };
     if !ok {
@@ -16442,7 +16853,10 @@ mod identity_sync_tests {
         let (tenant2, _org2, is_owner2) =
             resolve_identity_sync(false, None, None, None, "user_x", false);
         assert!(!is_owner2);
-        assert_eq!(tenant2, "personal", "unenforced personal-scope default is still literal \"personal\" (pre-existing dev behavior)");
+        assert_eq!(
+            tenant2, "personal",
+            "unenforced personal-scope default is still literal \"personal\" (pre-existing dev behavior)"
+        );
     }
 }
 
@@ -16510,25 +16924,29 @@ sub      A      9.9.9.9
 "#;
         let recs = parse_zone(zone, "example.com");
         // apex A
-        assert!(recs
-            .iter()
-            .any(|r| r.kind == "A" && r.name.is_empty() && r.value == "76.76.21.21"));
+        assert!(
+            recs.iter()
+                .any(|r| r.kind == "A" && r.name.is_empty() && r.value == "76.76.21.21")
+        );
         // www CNAME (trailing dot stripped)
-        assert!(recs
-            .iter()
-            .any(|r| r.kind == "CNAME" && r.name == "www" && r.value == "app.example.com"));
+        assert!(
+            recs.iter()
+                .any(|r| r.kind == "CNAME" && r.name == "www" && r.value == "app.example.com")
+        );
         // MX with priority
         let mx = recs.iter().find(|r| r.kind == "MX").expect("mx");
         assert_eq!(mx.priority, Some(10));
         assert_eq!(mx.value, "mail.example.com");
         // TXT keeps content (quotes stripped)
-        assert!(recs
-            .iter()
-            .any(|r| r.kind == "TXT" && r.value.contains("v=spf1")));
+        assert!(
+            recs.iter()
+                .any(|r| r.kind == "TXT" && r.value.contains("v=spf1"))
+        );
         // minimal "name TYPE value" form
-        assert!(recs
-            .iter()
-            .any(|r| r.kind == "A" && r.name == "sub" && r.value == "9.9.9.9"));
+        assert!(
+            recs.iter()
+                .any(|r| r.kind == "A" && r.name == "sub" && r.value == "9.9.9.9")
+        );
     }
 
     #[test]

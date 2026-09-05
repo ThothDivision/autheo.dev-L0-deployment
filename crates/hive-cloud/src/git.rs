@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "The optional build-cache and runtime-warmup paths remain compiled for capability validation, but are not enabled by the current deployment flow."
+)]
+
 //! Deploy from a git repository with a live, Vercel-style **build log**.
 //!
 //! `start_build` creates a build record (state = building) and returns its id
@@ -691,11 +696,7 @@ pub(crate) fn sanitize_tag(s: &str) -> String {
     let out = out
         .trim_matches(|c| c == '-' || c == '.' || c == '_')
         .to_string();
-    if out.is_empty() {
-        "app".into()
-    } else {
-        out
-    }
+    if out.is_empty() { "app".into() } else { out }
 }
 
 pub(crate) fn project_volume_name(
@@ -1888,6 +1889,53 @@ fn resolve_build_trust(
     })
 }
 
+/// Extract the only Marketplace policy input Hive is allowed to consume:
+/// authoritative node registry identifiers. Policy retrieval, Clerk
+/// authentication, tenant derivation, and schema validation happen in DevHub's
+/// server-only route; Hive must neither accept identity material nor refetch.
+///
+/// This defensive re-check protects CLI/internal paths from treating an
+/// incomplete Marketplace marker as an ordinary deployment. It intentionally
+/// does not relax to a local-node fallback: an absent eligible approved node is
+/// a placement refusal.
+fn marketplace_approved_nodes(
+    req: &GitDeployRequest,
+) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
+    let Some(snapshot) = req.marketplace_placement.as_ref() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        snapshot.contract_version == 1 && snapshot.policy_version > 0,
+        "MARKETPLACE_POLICY_INVALID: unsupported Marketplace policy version"
+    );
+    anyhow::ensure!(
+        !snapshot.marketplace_order_id.trim().is_empty()
+            && !snapshot.buyer_tenant_id.trim().is_empty(),
+        "MARKETPLACE_POLICY_INVALID: Marketplace order and buyer tenant are required"
+    );
+    anyhow::ensure!(
+        snapshot.policy.is_object(),
+        "MARKETPLACE_POLICY_INVALID: Marketplace policy snapshot is malformed"
+    );
+    let approved: std::collections::HashSet<String> = snapshot
+        .approved_node_ids
+        .iter()
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        })
+        .cloned()
+        .collect();
+    anyhow::ensure!(
+        !approved.is_empty() && approved.len() == snapshot.approved_node_ids.len(),
+        "MARKETPLACE_POLICY_INVALID: approved_node_ids must be a non-empty unique list of node ids"
+    );
+    Ok(Some(approved))
+}
+
 async fn run_build(
     cloud: &Arc<CloudState>,
     bid: &str,
@@ -1897,6 +1945,11 @@ async fn run_build(
     first_deploy: bool,
 ) -> anyhow::Result<()> {
     cloud.projects.get_exact(&project, incarnation)?;
+    // A Marketplace policy is a deployment-scoped, immutable authorization
+    // snapshot. Do not refetch it here: the Clerk JWT belongs exclusively to
+    // DevHub's server-side consumer. This process uses only the validated,
+    // safe node-id allowlist copied into the request before the build began.
+    let marketplace_approved_nodes = marketplace_approved_nodes(&req)?;
     let region = &cloud.region;
     let region_label = region_label(region);
     let log = |s: String| cloud.builds.log(bid, s);
@@ -2053,6 +2106,7 @@ async fn run_build(
             },
             !known_container,
             needs_build_isolation,
+            marketplace_approved_nodes.as_ref(),
         );
         // Nodes that can run repository build commands: the isolated executor
         // (Firecracker) OR a host-exec backend (mock/litebox) that builds on
@@ -2113,6 +2167,12 @@ async fn run_build(
             );
             log(msg.clone());
             tracing::warn!(project = %project, gpu_nodes, "deploy refused: gpu requested, no GPU-capable target");
+            return Err(anyhow::anyhow!(msg));
+        }
+        if req.marketplace_placement.is_some() && targets.is_empty() {
+            let msg = "MARKETPLACE_PLACEMENT_UNAVAILABLE: no approved Marketplace node is currently healthy, reachable, and capable. The deployment was not placed outside buyer-authorized nodes.".to_string();
+            log(msg.clone());
+            tracing::warn!(project = %project, "deploy refused: no eligible Marketplace-approved node");
             return Err(anyhow::anyhow!(msg));
         }
         // Same refusal for the wasm runtime, and for the identical reason the GPU
@@ -2232,7 +2292,7 @@ async fn run_build(
             // Pure remote placement: do NOT build/host locally. Dispatch to the
             // chosen region node(s), mirror their build into this build record,
             // then remove the project from any other node that still hosts it.
-            let names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
+            let mut names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
             log(format!(
                 "Placement: region-aware scheduler → {}",
                 names.join(", ")
@@ -2256,7 +2316,96 @@ async fn run_build(
             // `run_build`), collapsing the deploy to the primary region only —
             // while a STATELESS multi-region fanout proceeds on every target
             // exactly as before.
-            let ok = fanout_remote(cloud, bid, &req, &project, incarnation, &remote, true).await;
+            let mut ok = fanout_remote(cloud, bid, &req, &project, incarnation, &remote, true).await;
+            // DISPATCH FALLBACK. `nothing_ran` means every placed target was
+            // UNREACHABLE — the request never arrived anywhere, so nothing is
+            // known about the app and no node holds a half-finished build.
+            // That is exactly the condition under which trying the next
+            // capable node is free of side effects, and refusing to is how a
+            // single cold trunk failed eight consecutive deploys of one
+            // project (see `schedule::dispatch_fallbacks`). Candidates are
+            // tried ONE AT A TIME, each with `fanout_remote`'s own bounded
+            // per-target budget (HTTP 15s, then 2 x 20s iroh), and the loop
+            // stops the moment any node actually RAN the deploy — Ready,
+            // BuildFailed or Declined all mean the app was executed and the
+            // verdict below is about the app, not the fleet.
+            //
+            // Never for a project whose live container lease is held by one of
+            // the unreachable targets: its state volume lives on that node, and
+            // "deploying somewhere else" would silently fork it (the
+            // `place_for_project` stickiness rule). That deploy stays an honest
+            // reachability failure.
+            let mut fallback_landed: Option<String> = None;
+            if ok.nothing_ran() && !cloud.build_cancels.is_cancelled(bid) {
+                let pinned = cloud
+                    .leases
+                    .owner_of(&project)
+                    .filter(|holder| names.iter().any(|n| n == holder));
+                if let Some(holder) = pinned {
+                    log(format!(
+                        "No dispatch fallback: {holder} holds this project's live container lease (its state volume lives there), so the deploy is not moved to another node."
+                    ));
+                } else {
+                    let fallbacks = crate::schedule::dispatch_fallbacks(
+                        cloud,
+                        &regions,
+                        known_container,
+                        needs_gpu,
+                        crate::schedule::InterpreterNeeds {
+                            wasm: known_wasm,
+                            bun: known_bun,
+                        },
+                        !known_container,
+                        needs_build_isolation,
+                        &names,
+                    );
+                    let max = dispatch_fallback_max().min(fallbacks.len());
+                    if fallbacks.is_empty() {
+                        log("No dispatch fallback available: no other healthy, capable, reachable node is known to the mesh.".into());
+                    }
+                    let node_region: std::collections::HashMap<String, String> = cloud
+                        .registry
+                        .nodes()
+                        .into_iter()
+                        .map(|n| (n.name, n.region))
+                        .collect();
+                    for (idx, cand) in fallbacks.iter().take(max).enumerate() {
+                        if cloud.build_cancels.is_cancelled(bid) {
+                            break;
+                        }
+                        let region = node_region.get(&cand.node).cloned().unwrap_or_default();
+                        let in_region = regions
+                            .iter()
+                            .any(|r| r.trim().eq_ignore_ascii_case(&region));
+                        log(format!(
+                            "→ fallback {}/{}: {} ({}{}) — {} could not be reached, dispatching the deploy there instead",
+                            idx + 1,
+                            max,
+                            cand.node,
+                            region,
+                            if in_region { "" } else { ", outside the configured region(s)" },
+                            ok.unreachable().join(", ")
+                        ));
+                        let attempt = fanout_remote(
+                            cloud,
+                            bid,
+                            &req,
+                            &project,
+                            incarnation,
+                            std::slice::from_ref(cand),
+                            true,
+                        )
+                        .await;
+                        names.push(cand.node.clone());
+                        let ran = !attempt.nothing_ran();
+                        ok.per_target.extend(attempt.per_target);
+                        if ran {
+                            fallback_landed = Some(cand.node.clone());
+                            break;
+                        }
+                    }
+                }
+            }
             // Atomic promotion (Vercel convention): only relocate — i.e. remove the
             // project from nodes that still host the PREVIOUS deployment — once the
             // new placement actually built & is serving. A FAILED build must never
@@ -2290,7 +2439,12 @@ async fn run_build(
                 // DEGRADED, not failed: name every target the deploy could not
                 // be delivered to, so the operator sees reduced replication
                 // instead of silence, and so a later reconcile can repair it.
-                if !unreachable.is_empty() {
+                if let Some(landed) = fallback_landed.as_deref().filter(|_| ok.ready() > 0) {
+                    log(format!(
+                        "⚠ Deployed on {landed} because {} could not be reached. The configured region is a preference, not a fence: the next deploy re-evaluates placement and lands back in region once that node is reachable again.",
+                        unreachable.join(", ")
+                    ));
+                } else if !unreachable.is_empty() {
                     log(format!(
                         "⚠ Deployed to {} of {} target(s). Could not reach: {} — those regions ran \
                          nothing and are DEGRADED, not failed; replication is repaired when they \
@@ -3147,9 +3301,10 @@ async fn run_build(
             selection.relative.to_string_lossy().replace('\\', "/")
         };
         log(format!(
-            "Auto-detected workspace app: {relative} ({}; evidence: {}).",
+            "Auto-detected workspace app: {relative} ({}; evidence: {}; decision: {}).",
             selection.workspace_source,
-            selection.evidence.join(", ")
+            selection.evidence.join(", "),
+            selection.decision_digest,
         ));
         let selected = if selection.relative.as_os_str().is_empty() {
             checkout_dir.clone()
@@ -3740,6 +3895,251 @@ async fn run_build(
         return Ok(());
     }
 
+    // Managed World auto-wiring: any project detected to use the Vercel
+    // Workflow SDK (JS/TS via the .well-known manifest the build step above
+    // already emitted, or Python via a vercel.json experimentalServices
+    // __wkf_* worker) gets BOTH halves of hive's own native World -- Queue
+    // (this dispatcher) and Storage (a real provisioned Redis, same
+    // provision() path as a database created from the dashboard) -- wired in
+    // by DEFAULT, unless it already brought its own Upstash/Redis world
+    // config (BYO opt-out) or sets fluid.json `{"workflow":{"world":
+    // "external"}}`. MUST run before `staged.prove_ready()` below, not after
+    // it: an app whose own build config (e.g. next.config.ts calling
+    // `process.env.WORKFLOW_TARGET_WORLD = "@open-workflow/world-redis"`)
+    // constructs its World client eagerly at server-startup import time
+    // throws/crashes with no HIVE_QUEUE_ENDPOINT/UPSTASH_REDIS_REST_URL yet
+    // set -- the process never binds its port, prove_ready() times out, and
+    // the `?` on it aborts run_build before ever reaching this block. Since
+    // this block only ever WROTE env for the NEXT deploy, that made the
+    // very first deploy of any true Workflow-SDK app permanently
+    // unrecoverable: every redeploy re-ran the identical unwired build and
+    // failed at the identical spot before ever getting a chance to wire
+    // itself. Moving it here, before prove_ready(), means a fresh project's
+    // FIRST deploy already has HIVE_QUEUE_ENDPOINT/_TOKEN in the env this
+    // build's own launch reads -- Storage (Redis) still finishes async in
+    // the background as before, since UPSTASH_REDIS_REST_URL only matters
+    // once the app actually calls into the World, not at process boot.
+    // Persisted via put_env (same mechanism/timing as every other project
+    // env var). Idempotent across redeploys: once Storage is provisioned,
+    // apply_db_egress sets UPSTASH_REDIS_REST_URL, which
+    // workflow_world_opted_out treats as BYO on every later deploy, so this
+    // block runs at most once per project. Deliberately does NOT set
+    // WORKFLOW_TARGET_WORLD itself: no @open-workflow/world-hive-equivalent
+    // package is published for tenant apps to import yet, and forcing that
+    // env var without a resolvable module would break an app that never
+    // asked for it -- what's wired now makes both backing services ready
+    // the moment a compatible World package is present (or, as here, the
+    // moment the app's OWN config points itself at world-redis), and
+    // world.rs's dashboard reader already falls back to
+    // UPSTASH_REDIS_REST_URL/_TOKEN so the Workflows tab lights up
+    // immediately once Storage finishes provisioning, independent of the
+    // World package.
+    {
+        let ingested_early = find_workflow_manifest(&build_dir).is_some();
+        let py_wdk = crate::world_queue::vercel_json_declares_workflow_worker(&build_dir);
+        let opted_out =
+            crate::world_queue::workflow_world_opted_out(cloud, &project, &build_dir);
+        tracing::info!(
+            %project,
+            ingested_early,
+            py_wdk,
+            opted_out,
+            "workflow World auto-wiring gate evaluated (pre-launch)"
+        );
+        if (ingested_early || py_wdk) && !opted_out {
+            let queue_url = std::env::var("HIVE_QUEUE_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:8786".to_string());
+            // `tenant`'s sticky-inherit-from-peers resolution isn't bound
+            // until later in the pipeline; `project_settings.team` (already
+            // loaded above for the runtime-env resolution) is the same
+            // underlying source without that fallback -- fine for this
+            // auxiliary feature, which only tags the queue-client identity
+            // and the provisioned Redis's billing/quota owner.
+            let team = crate::admin::norm(&project_settings.team).to_string();
+            // Best-effort, same discipline as the `claim_database_exact` guard
+            // below: `put_env_exact`'s `?` used to propagate an incarnation
+            // mismatch straight out of `run_build` with NO log line at all,
+            // silently failing the whole (already-deployed) build. Track
+            // whether either write actually landed so a genuine failure here
+            // skips the Redis provisioning below instead of leaving env vars
+            // half-written, and always leaves a trace either way.
+            let mut queue_env_written = false;
+            if let Ok(queue_token) = crate::auth::issue(
+                "world-queue-client",
+                &team,
+                "service",
+                false,
+                365 * 24 * 3600,
+            ) {
+                let endpoint_result = cloud.projects.put_env_exact(
+                    &project,
+                    incarnation,
+                    crate::project_settings::EnvVar {
+                        key: "HIVE_QUEUE_ENDPOINT".into(),
+                        value: queue_url,
+                        target: "all".into(),
+                        scope: "runtime".into(),
+                        sensitive: false,
+                        updated_ms: now_ms(),
+                    },
+                );
+                let token_result = cloud.projects.put_env_exact(
+                    &project,
+                    incarnation,
+                    crate::project_settings::EnvVar {
+                        key: "HIVE_QUEUE_TOKEN".into(),
+                        value: queue_token,
+                        target: "all".into(),
+                        scope: "runtime".into(),
+                        sensitive: true,
+                        updated_ms: now_ms(),
+                    },
+                );
+                match (endpoint_result, token_result) {
+                    (Ok(()), Ok(())) => queue_env_written = true,
+                    (Err(error), _) | (_, Err(error)) => {
+                        tracing::warn!(
+                            %project,
+                            %incarnation,
+                            %error,
+                            "workflow queue env write lost project-incarnation authority — skipping World auto-wiring for this build, next deploy will retry"
+                        );
+                        log(
+                            "Vercel Workflow SDK detected, but a concurrent deploy raced the \
+                             queue env write -- skipped for this build; it will retry on the \
+                             next deploy."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            if queue_env_written {
+                // Stamp HIVE_QUEUE_ENDPOINT/_TOKEN directly onto every
+                // function in THIS build's own manifest so the process this
+                // function is about to launch has them immediately --
+                // writing them via put_env_exact above only updates the
+                // persisted project record, and this build's own env
+                // (`runtime_env`/`env`) was already resolved into
+                // `manifest.functions[].env` earlier in the pipeline, well
+                // before this block runs.
+                if let Ok(fresh) = cloud.projects.get_exact(&project, incarnation) {
+                    let queue_env: Vec<(String, String)> = ["HIVE_QUEUE_ENDPOINT", "HIVE_QUEUE_TOKEN"]
+                        .into_iter()
+                        .filter_map(|key| {
+                            fresh
+                                .env
+                                .iter()
+                                .find(|e| e.key == key)
+                                .map(|value| (key.to_string(), value.value.clone()))
+                        })
+                        .collect();
+                    for f in manifest.functions.iter_mut() {
+                        for (k, v) in &queue_env {
+                            f.env.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                let dbreq = crate::databases::ProvisionReq {
+                    name: "workflow-storage".into(),
+                    project: project.clone(),
+                    team,
+                    kind: crate::databases::DbKind::Redis,
+                    region: Some(cloud.region.clone()),
+                    provider: None,
+                    replicas: Vec::new(),
+                };
+                let cloud_ready = cloud.clone();
+                let ready_project = project.clone();
+                // Provisioning completes after this build returns. Keep it in
+                // the exact-incarnation drain set so project deletion cannot
+                // inventory storage until this callback has either committed
+                // under lifecycle authority or yielded to the delete.
+                let completion_guard = Arc::new(parking_lot::Mutex::new(Some(
+                    ActiveCheckoutGuard::new(build_dir.clone(), &ready_project, incarnation),
+                )));
+                let workflow_database = crate::databases::provision(
+                    cloud.databases.clone(),
+                    cloud.region.clone(),
+                    dbreq,
+                    cloud.db_domain.clone(),
+                    cloud.node_name.clone(),
+                    cloud.api_base(),
+                    move |d| {
+                        let cloud_ready = cloud_ready.clone();
+                        let ready_project = ready_project.clone();
+                        let completion_guard = completion_guard.clone();
+                        tokio::spawn(async move {
+                            // `provision` accepts `Fn`, not `FnOnce`, so
+                            // transfer the single reservation out exactly
+                            // once. Never hold it while awaiting the
+                            // lifecycle writer: deletion owns the writer
+                            // while it drains this exact reservation.
+                            let completion_guard = completion_guard.lock().take();
+                            drop(completion_guard);
+                            let _lifecycle =
+                                crate::project_settings::lifecycle_write(&ready_project).await;
+                            if cloud_ready
+                                .projects
+                                .get_exact(&ready_project, incarnation)
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    project = %ready_project,
+                                    %incarnation,
+                                    database = %d.id,
+                                    "discarded delayed workflow-storage completion for a deleted project incarnation"
+                                );
+                                return;
+                            }
+                            if matches!(d.status, crate::databases::DbStatus::Ready) {
+                                crate::admin::apply_db_egress(&cloud_ready, &d);
+                            }
+                            crate::persist::persist(&cloud_ready);
+                        });
+                    },
+                );
+                // Best-effort, matching the WDK-manifest ingest above: a lost
+                // incarnation race here (a concurrent redeploy of the SAME
+                // project bumped it between this build's entry and this
+                // pipeline stage — the app itself has typically already
+                // deployed successfully by this point) must never fail the
+                // whole build. This previously returned `Err`, which the
+                // caller (`run_build`'s spawn site) turns into
+                // `DeployState::Error` for the ENTIRE deployment — a
+                // non-critical auxiliary feature (workflow storage
+                // auto-wiring) retroactively failing an already-successful
+                // app deployment. Tear down the orphaned database and just
+                // skip the wiring; the next deploy gets another chance.
+                if let Err(error) = cloud.projects.claim_database_exact(
+                    &project,
+                    incarnation,
+                    workflow_database.id.clone(),
+                ) {
+                    crate::databases::note_teardown_request(&workflow_database.id);
+                    cloud
+                        .databases
+                        .remove_db_and_purge_data(&workflow_database.id, &workflow_database.team);
+                    tracing::warn!(
+                        %project,
+                        database = %workflow_database.id,
+                        %error,
+                        "workflow storage lost project-incarnation authority before admission — skipping auto-wiring for this build, next deploy will retry"
+                    );
+                    log(
+                        "Vercel Workflow SDK detected, but a concurrent deploy raced the storage \
+                         auto-wiring -- skipped for this build; it will retry on the next deploy."
+                            .to_string(),
+                    );
+                } else {
+                    log(format!(
+                        "Detected Vercel Workflow SDK ({}): auto-wired hive's managed World -- Queue (HIVE_QUEUE_ENDPOINT/_TOKEN) active for this deploy, Storage (a provisioned Redis, UPSTASH_REDIS_REST_URL/_TOKEN) finishing in the background -- fully active from the next deploy.",
+                        if ingested_early { "JS/TS" } else { "Python" }
+                    ));
+                }
+            }
+        }
+    }
+
     // Build-time bytecode-cache warm-up: precompile the server's bytecode INTO
     // the artifact so a fresh microVM's first hit skips parse/compile. Dispatches
     // per the SINGLE resolved runtime (`hive_core::Runtime`, replacing what used
@@ -3819,8 +4219,7 @@ async fn run_build(
             })
             .collect();
         if !dropped.is_empty() {
-            let msg =
-                format!(
+            let msg = format!(
                 "Browser opt-in rejected — the deployment was NOT registered. fluid.json declares \
                  `functions[].browser` for {}, but this project builds through the {} path, which \
                  constructs its own function list and cannot carry a per-function browser opt-in. \
@@ -3841,7 +4240,11 @@ async fn run_build(
                     })
                     .collect::<Vec<_>>()
                     .join(", "),
-                if is_container { "container" } else { "framework-detected" },
+                if is_container {
+                    "container"
+                } else {
+                    "framework-detected"
+                },
                 manifest
                     .functions
                     .iter()
@@ -4016,6 +4419,27 @@ async fn run_build(
             artifact_relative.to_path_buf(),
         )
     };
+    // Launch-shape preflight BEFORE sealing: a direct-interpreter function
+    // (`node <entry>` / `bun <entry>`) whose entry module is not in the tree
+    // about to be sealed can never start anywhere, so it fails HERE — naming
+    // the entry, where it was looked for, and the fluid.json/package.json
+    // field that chose it — instead of at the post-registration readiness
+    // launch, where litebox answered with a `tar: … Not found in archive`
+    // dump under a NODE-fault marker (witnessed: serverless-clawdbot@xstate,
+    // dpl-0123447de0 on fc-sanjose-3 — fluid.json `start_cmd: ["node",
+    // "server.js"]` for a Next.js repo with no server.js; the fluid.json
+    // lane runs no install/build, so nothing could have produced it).
+    if !build_failed && !is_container {
+        let fluid_json_present = build_dir.join("fluid.json").is_file();
+        if let Err(error) =
+            preflight_direct_entries(&manifest, &runtime_artifact, fluid_json_present).await
+        {
+            let msg = format!("{error:#}");
+            log(msg.clone());
+            tracing::warn!(project = %project, %msg, "launch-shape preflight refused the build");
+            return Err(error);
+        }
+    }
     let image = format!("dpl-{}", sanitize_tag(bid));
     let (host_static_root, runtime_workdir, runtime_artifact_identity, sealed_runtime_artifact) =
         if !build_failed && !is_container {
@@ -4108,7 +4532,11 @@ async fn run_build(
         Ok(ports) if !ports.is_empty() => {
             log(format!(
                 "Allocated public raw port(s): {} (stable across redeploys).",
-                ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+                ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
             // A compose publish request asked for a LITERAL host port. Name the
             // outcome for every such spec — grant == request is confirmation,
@@ -4240,157 +4668,23 @@ async fn run_build(
             .projects
             .claim_volumes_exact(&project, incarnation, volume_names)?;
     }
-    let previous_production = cloud
-        .gw
-        .list()
-        .into_iter()
-        .find(|deployment| {
-            deployment.project == project
-                && deployment.project_incarnation == Some(incarnation)
-                && deployment.production
-                && deployment.state == DeployState::Ready
-        })
-        .map(|deployment| deployment.id.to_string());
-    let source = crate::deployment_ledger::SourceIdentity {
-        kind: if req.image_ref.is_some() {
-            crate::deployment_ledger::SourceKind::PrebuiltImage
-        } else if req.repo_url.starts_with("upload://") {
-            crate::deployment_ledger::SourceKind::Upload
+    let info = cloud.gw.deploy_full_with_runtime_exact_marketplace(
+        host_static_root,
+        Some(runtime_workdir),
+        manifest,
+        req.creator.clone().unwrap_or_else(|| "you".into()),
+        Some(git),
+        flip_production,
+        if build_failed {
+            DeployState::Error
         } else {
             crate::deployment_ledger::SourceKind::Git
         },
-        repository: req.repo_url.clone(),
-        branch: actual_branch.clone(),
-        revision: if let Some(image) = req.image_ref.as_ref() {
-            image.clone()
-        } else if full_sha.is_empty() {
-            commit.clone()
-        } else {
-            full_sha.clone()
-        },
-    };
-    let info = if build_failed {
-        let info = cloud.gw.deploy_full_with_runtime_exact(
-            host_static_root,
-            Some(runtime_workdir),
-            manifest,
-            req.creator.clone().unwrap_or_else(|| "you".into()),
-            Some(git),
-            is_production,
-            DeployState::Error,
-            tenant.clone(),
-            incarnation,
-        );
-        crate::admin::causal_stamp_new_deployment(cloud, &project, &info.id.0);
-        info
-    } else {
-        let mut staged = cloud.gw.stage_full_with_runtime_exact(
-            host_static_root,
-            Some(runtime_workdir),
-            manifest,
-            req.creator.clone().unwrap_or_else(|| "you".into()),
-            Some(git),
-            is_production,
-            tenant.clone(),
-            incarnation,
-        )?;
-        let deployment_id = staged.info().id.to_string();
-        crate::admin::causal_stamp_new_deployment(cloud, &project, &deployment_id);
-        let readiness = staged.prove_ready().await?.clone();
-        cloud
-            .deployment_ledger
-            .accept(crate::deployment_ledger::DeploymentAcceptanceInput {
-                deployment_id: deployment_id.clone(),
-                project: project.clone(),
-                target: if is_production {
-                    "production".to_string()
-                } else {
-                    "preview".to_string()
-                },
-                source,
-                repository_build: repository_build.clone(),
-                runtime_artifact: runtime_artifact_identity.clone(),
-                readiness,
-            })?;
-        let (mut info, _readiness) = staged.publish_ready()?;
-        if !crate::persist::persist_durable(cloud) {
-            cloud.gw.remove(&deployment_id).await;
-            anyhow::bail!(
-                "deployment {deployment_id} passed readiness but its Ready record could not be persisted"
-            );
-        }
-        let ready_alias = if !info.commit_alias.is_empty() {
-            info.commit_alias.clone()
-        } else {
-            info.id_alias.clone()
-        };
-        if let Err(error) = cloud.deployment_ledger.mark_published(
-            &deployment_id,
-            serde_json::json!({
-                "id": deployment_id,
-                "project": info.project,
-                "url": cloud.deploy_url(&ready_alias),
-                "state": "ready",
-                "production": false,
-                "target": info.target,
-                "commit": commit,
-            }),
-        ) {
-            cloud.gw.remove(&info.id.to_string()).await;
-            let _ = crate::persist::persist_durable(cloud);
-            return Err(error.context("durably publish deployment readiness"));
-        }
-        if is_production {
-            let alias_revision = cloud.deployment_ledger.prepare_alias(
-                &project,
-                previous_production.clone(),
-                &info.id.to_string(),
-            )?;
-            let Some(promoted) = cloud.gw.promote_exact(&info.id.to_string(), incarnation) else {
-                cloud
-                    .deployment_ledger
-                    .abort_alias(alias_revision, "gateway refused accepted deployment")?;
-                anyhow::bail!(
-                    "accepted deployment {} could not acquire its production alias",
-                    info.id
-                );
-            };
-            if !crate::persist::persist_durable(cloud) {
-                cloud
-                    .deployment_ledger
-                    .abort_alias(alias_revision, "platform-state alias persistence failed")?;
-                if let Some(previous) = previous_production.as_deref() {
-                    let _ = cloud.gw.promote_exact(previous, incarnation);
-                } else {
-                    cloud.gw.remove(&promoted.id.to_string()).await;
-                }
-                let _ = crate::persist::persist_durable(cloud);
-                anyhow::bail!("production alias revision {alias_revision} could not be persisted");
-            }
-            info = promoted;
-            if let Err(error) = cloud.deployment_ledger.mark_alias_applied(
-                alias_revision,
-                serde_json::json!({
-                    "id": info.id.to_string(),
-                    "project": info.project,
-                    "url": cloud.deploy_url(&info.alias),
-                    "state": "ready",
-                    "production": true,
-                    "target": "production",
-                    "commit": commit,
-                    "aliasRevision": alias_revision,
-                }),
-            ) {
-                tracing::error!(
-                    deployment = %info.id,
-                    alias_revision,
-                    %error,
-                    "production alias is durably applied; ledger finalization remains pending"
-                );
-            }
-        }
-        info
-    };
+        tenant.clone(),
+        incarnation,
+        req.marketplace_placement.clone(),
+    );
+    crate::admin::causal_stamp_new_deployment(cloud, &project, &info.id.0);
 
     // Record deployment ownership of each browser artifact now that the
     // deployment id exists (`deploy_full` mints it). The bytes are already
@@ -4440,152 +4734,11 @@ async fn run_build(
     // Ingest any Vercel WDK manifest the app emitted (`.well-known/workflow/v1/
     // manifest.json`) so its workflows + step graphs appear in the Workflows tab
     // and render on the canvas. Best-effort: a non-WDK app simply has none.
-    let ingested = ingest_workflow_manifest(cloud, &info.project, &build_dir).await;
+    let ingested = ingest_workflow_manifest(cloud, &project, &build_dir).await;
     if ingested > 0 {
         log(format!(
             "Detected Vercel WDK: registered {ingested} workflow(s) for the Workflows tab."
         ));
-    }
-
-    // Managed World auto-wiring: any project detected to use the Vercel
-    // Workflow SDK (JS/TS via the .well-known manifest just ingested above, or
-    // Python via a vercel.json experimentalServices __wkf_* worker) gets BOTH
-    // halves of hive's own native World -- Queue (this dispatcher) and Storage
-    // (a real provisioned Redis, same provision() path as a database created
-    // from the dashboard) -- wired in by DEFAULT, unless it already brought
-    // its own Upstash/Redis world config (BYO opt-out) or sets fluid.json
-    // `{"workflow":{"world":"external"}}`. Persisted via put_env (same
-    // mechanism/timing as every other project env var -- takes effect
-    // starting the NEXT deploy, since this build's function manifest is
-    // already finalized by this point in the pipeline). Idempotent across
-    // redeploys: once Storage is provisioned, apply_db_egress sets
-    // UPSTASH_REDIS_REST_URL, which workflow_world_opted_out treats as BYO on
-    // every later deploy, so this block runs at most once per project.
-    // Deliberately does NOT set WORKFLOW_TARGET_WORLD: no
-    // @open-workflow/world-hive-equivalent package is published for tenant
-    // apps to import yet, and forcing that env var without a resolvable
-    // module would break the app rather than help it -- what's wired now
-    // makes both backing services ready the moment a compatible World
-    // package is present, and world.rs's dashboard reader already falls back
-    // to UPSTASH_REDIS_REST_URL/_TOKEN so the Workflows tab lights up
-    // immediately once Storage finishes provisioning, independent of the
-    // World package.
-    {
-        let py_wdk = crate::world_queue::vercel_json_declares_workflow_worker(&build_dir);
-        if (ingested > 0 || py_wdk)
-            && !crate::world_queue::workflow_world_opted_out(cloud, &info.project, &build_dir)
-        {
-            let queue_url = std::env::var("HIVE_QUEUE_ENDPOINT")
-                .unwrap_or_else(|_| "http://127.0.0.1:8786".to_string());
-            let team = crate::admin::norm(&tenant).to_string();
-            if let Ok(queue_token) = crate::auth::issue(
-                "world-queue-client",
-                &team,
-                "service",
-                false,
-                365 * 24 * 3600,
-            ) {
-                cloud.projects.put_env_exact(
-                    &info.project,
-                    incarnation,
-                    crate::project_settings::EnvVar {
-                        key: "HIVE_QUEUE_ENDPOINT".into(),
-                        value: queue_url,
-                        target: "all".into(),
-                        scope: "runtime".into(),
-                        sensitive: false,
-                        updated_ms: now_ms(),
-                    },
-                )?;
-                cloud.projects.put_env_exact(
-                    &info.project,
-                    incarnation,
-                    crate::project_settings::EnvVar {
-                        key: "HIVE_QUEUE_TOKEN".into(),
-                        value: queue_token,
-                        target: "all".into(),
-                        scope: "runtime".into(),
-                        sensitive: true,
-                        updated_ms: now_ms(),
-                    },
-                )?;
-            }
-            let req = crate::databases::ProvisionReq {
-                name: "workflow-storage".into(),
-                project: info.project.clone(),
-                team,
-                kind: crate::databases::DbKind::Redis,
-                region: Some(cloud.region.clone()),
-                provider: None,
-                replicas: Vec::new(),
-            };
-            let cloud_ready = cloud.clone();
-            let ready_project = info.project.clone();
-            // Provisioning completes after this build returns. Keep it in the
-            // exact-incarnation drain set so project deletion cannot inventory
-            // storage until this callback has either committed under lifecycle
-            // authority or yielded to the delete.
-            let completion_guard = Arc::new(parking_lot::Mutex::new(Some(
-                ActiveCheckoutGuard::new(build_dir.clone(), &ready_project, incarnation),
-            )));
-            let workflow_database = crate::databases::provision(
-                cloud.databases.clone(),
-                cloud.region.clone(),
-                req,
-                cloud.db_domain.clone(),
-                cloud.node_name.clone(),
-                cloud.api_base(),
-                move |d| {
-                    let cloud_ready = cloud_ready.clone();
-                    let ready_project = ready_project.clone();
-                    let completion_guard = completion_guard.clone();
-                    tokio::spawn(async move {
-                        // `provision` accepts `Fn`, not `FnOnce`, so transfer
-                        // the single reservation out exactly once. Never hold
-                        // it while awaiting the lifecycle writer: deletion owns
-                        // the writer while it drains this exact reservation.
-                        let completion_guard = completion_guard.lock().take();
-                        drop(completion_guard);
-                        let _lifecycle =
-                            crate::project_settings::lifecycle_write(&ready_project).await;
-                        if cloud_ready
-                            .projects
-                            .get_exact(&ready_project, incarnation)
-                            .is_err()
-                        {
-                            tracing::warn!(
-                                project = %ready_project,
-                                %incarnation,
-                                database = %d.id,
-                                "discarded delayed workflow-storage completion for a deleted project incarnation"
-                            );
-                            return;
-                        }
-                        if matches!(d.status, crate::databases::DbStatus::Ready) {
-                            crate::admin::apply_db_egress(&cloud_ready, &d);
-                        }
-                        crate::persist::persist(&cloud_ready);
-                    });
-                },
-            );
-            if let Err(error) = cloud.projects.claim_database_exact(
-                &info.project,
-                incarnation,
-                workflow_database.id.clone(),
-            ) {
-                crate::databases::note_teardown_request(&workflow_database.id);
-                cloud
-                    .databases
-                    .remove_db_and_purge_data(&workflow_database.id, &workflow_database.team);
-                return Err(anyhow::anyhow!(
-                    "workflow storage lost project-incarnation authority before admission: {error}"
-                ));
-            }
-            log(format!(
-                "Detected Vercel Workflow SDK ({}): auto-wired hive's managed World -- Queue (HIVE_QUEUE_ENDPOINT/_TOKEN) now, Storage (a provisioned Redis, UPSTASH_REDIS_REST_URL/_TOKEN) finishing in the background -- both active from the next deploy.",
-                if ingested > 0 { "JS/TS" } else { "Python" }
-            ));
-        }
     }
 
     // The host THIS deployment answers on. `info.alias` is the PROJECT's
@@ -4751,6 +4904,7 @@ async fn run_build(
             },
             true,
             true,
+            marketplace_approved_nodes.as_ref(),
         );
         if targets
             .iter()
@@ -5127,6 +5281,19 @@ pub(crate) enum TargetOutcome {
     Declined,
 }
 
+/// How many fallback candidates a pure-remote deploy tries after EVERY placed
+/// target proved unreachable (`HIVE_DEPLOY_DISPATCH_FALLBACK_MAX`, default 3).
+/// Each candidate is bounded by `fanout_remote`'s own per-target budget, so the
+/// worst case is `(1 + this) x (15s HTTP + 2 x 20s iroh)` of pure dispatch time
+/// before the deploy is declared unreachable — sized like the sandbox
+/// delegation's candidate walk, not an unbounded fleet sweep.
+fn dispatch_fallback_max() -> usize {
+    std::env::var("HIVE_DEPLOY_DISPATCH_FALLBACK_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(3)
+}
+
 /// The aggregate verdict over every target of one fan-out.
 pub(crate) struct FanoutOutcome {
     pub per_target: Vec<(String, TargetOutcome)>,
@@ -5159,6 +5326,17 @@ impl FanoutOutcome {
     /// Targets that deliberately refused to host (stateful single-writer guard).
     pub(crate) fn declined(&self) -> usize {
         self.count(TargetOutcome::Declined)
+    }
+    /// Every target was unreachable: the request arrived NOWHERE, so no node
+    /// ran, declined or failed the app. The one condition under which trying
+    /// another node is free of side effects — see the dispatch fallback in
+    /// `run_build`.
+    pub(crate) fn nothing_ran(&self) -> bool {
+        !self.per_target.is_empty()
+            && self
+                .per_target
+                .iter()
+                .all(|(_, o)| *o == TargetOutcome::DispatchFailed)
     }
     /// PROMOTION POLICY: at least one target is genuinely serving.
     ///
@@ -5289,7 +5467,7 @@ async fn fanout_remote(
                 .post(format!("{admin}{RUNTIME_ARTIFACT_FANOUT_PATH}"))
                 .header("x-hive-team", team.clone());
             if crate::auth::enforced() {
-                if let Ok(tok) = crate::auth::issue("mesh-internal", &team, "service", false, 60) {
+                if let Ok(tok) = crate::auth::issue("mesh-internal", &team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
                     rb = rb.bearer_auth(tok);
                 }
             }
@@ -5318,17 +5496,61 @@ async fn fanout_remote(
                     "{RUNTIME_ARTIFACT_FANOUT_PATH}?{}",
                     crate::admin::mesh_team_qs(&team)
                 );
-                match crate::gossip::request_to(
-                    cloud,
-                    id,
-                    addr,
-                    hive_p2p::GOSSIP_POST,
-                    &path,
-                    &body,
-                    20,
-                )
-                .await
-                {
+                // `PeerPool::request`'s own doc is explicit that it retries a
+                // PRE-send failure once internally but deliberately leaves a
+                // POST-send failure (the request already on the wire) to the
+                // caller's own failover judgment — see hive-p2p's
+                // `request_stream` doc. For a node whose ONLY route is iroh
+                // (no HTTP admin — see `Target`'s doc), a single post-send
+                // firstbyte timeout on an otherwise-healthy trunk (intermittent
+                // path degradation, not the peer being down) used to end the
+                // whole dispatch attempt with no second try. `run_build`'s
+                // request body is idempotent from the target's perspective
+                // (the target's own stateful fanout-replica guard governs
+                // whether it actually starts a build), so retrying it here is
+                // safe. Bounded at 2 attempts total, same shape as the
+                // pre-send retries elsewhere in this stack.
+                let mut iroh_result = None;
+                let mut last_failure = String::new();
+                for iroh_attempt in 1..=2 {
+                    let t0 = std::time::Instant::now();
+                    match crate::gossip::request_to(
+                        cloud,
+                        id,
+                        addr,
+                        hive_p2p::GOSSIP_POST,
+                        &path,
+                        &body,
+                        20,
+                    )
+                    .await
+                    {
+                        Some(b) => {
+                            iroh_result = Some(b);
+                            break;
+                        }
+                        None => {
+                            // Name the MEASURED elapsed time. The previous text
+                            // claimed "timed out after 20s" for every failure,
+                            // while the witnessed ones (2026-09-01, eight
+                            // express deploys) all failed in 5-15s: the DIAL
+                            // failed (cached-hint connect timeout + fresh-
+                            // discovery giving up) long before the 20s request
+                            // budget — a different fault than a peer that
+                            // accepted the stream and never answered.
+                            let elapsed_ms = t0.elapsed().as_millis();
+                            last_failure = if elapsed_ms >= 19_500 {
+                                format!("iroh: no reply within the 20s request budget ({elapsed_ms}ms; the peer accepted nothing or answered nothing)")
+                            } else {
+                                format!("iroh: dial failed after {elapsed_ms}ms (no QUIC path to the peer: cached-hint connect timed out and fresh discovery gave up)")
+                            };
+                            if iroh_attempt < 2 {
+                                cloud.builds.log(bid, format!("→ {}: iroh dispatch timed out, retrying once", t.node));
+                            }
+                        }
+                    }
+                }
+                match iroh_result {
                     Some(b) => match serde_json::from_slice(&b) {
                         Ok(v) => Some(v),
                         Err(e) => {
@@ -5337,8 +5559,7 @@ async fn fanout_remote(
                         }
                     },
                     None => {
-                        attempt_failures
-                            .push("iroh: no reply (peer unreachable over the mesh, or timed out after 20s)".into());
+                        attempt_failures.push(last_failure);
                         None
                     }
                 }
@@ -5517,42 +5738,23 @@ async fn mirror_remote_build(
 ) -> TargetOutcome {
     let mut mirrored = 0usize;
     let mut polls_failed = 0usize;
-    // INACTIVITY deadline, not an absolute cap. The old fixed 10-minute cap
-    // declared "remote build timed out" for any legitimately long build (a
-    // large monorepo's install + build alone routinely exceeds it on a 4-core
-    // builder) even while every poll was succeeding and log lines were
-    // streaming. Only a window with ZERO successful state reads now counts
-    // toward giving up; every successful read pushes the deadline out. A much
-    // larger absolute ceiling still bounds the whole mirror so a target wedged
-    // in `Building` forever cannot pin this coordinator task indefinitely.
-    let idle_window_ms = std::env::var("HIVE_BUILD_MIRROR_IDLE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(10 * 60 * 1000);
-    let ceiling_ms = std::env::var("HIVE_BUILD_MIRROR_MAX_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(120 * 60 * 1000);
-    let started = now_ms();
-    let mut deadline = started + idle_window_ms;
+    let deadline = now_ms() + 10 * 60 * 1000; // 10 min cap
     // AUTH FOR THE POLL, not just the dispatch. `/v1/builds/:id` is
-                                              // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
-                                              // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
-                                              // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
-                                              // anonymous tenant, `build_owned_by` never matched the build's real
-                                              // team, and every poll 404'd — INCLUDING every poll against a target
-                                              // build that had already finished. Verified live: 400/400 polls failed
-                                              // for a target build that reached `ready` in under 3 seconds, on a
-                                              // reachable node, every single time. This is not a mesh-health symptom;
-                                              // it silently broke remote-build status mirroring for every
-                                              // fanout-placed deployment on the whole fleet, always burning the full
-                                              // 10-minute deadline regardless of how fast the actual remote build was.
-                                              // `mesh_team_qs` is the SAME delegation-token minting already used for
-                                              // every other mesh-internal proxied read (`fetch_from_host` and
-                                              // friends) — the coordinator knows the real owning team from its own
-                                              // local build record, so it can assert it the same way.
+    // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
+    // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
+    // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
+    // anonymous tenant, `build_owned_by` never matched the build's real
+    // team, and every poll 404'd — INCLUDING every poll against a target
+    // build that had already finished. Verified live: 400/400 polls failed
+    // for a target build that reached `ready` in under 3 seconds, on a
+    // reachable node, every single time. This is not a mesh-health symptom;
+    // it silently broke remote-build status mirroring for every
+    // fanout-placed deployment on the whole fleet, always burning the full
+    // 10-minute deadline regardless of how fast the actual remote build was.
+    // `mesh_team_qs` is the SAME delegation-token minting already used for
+    // every other mesh-internal proxied read (`fetch_from_host` and
+    // friends) — the coordinator knows the real owning team from its own
+    // local build record, so it can assert it the same way.
     let team = cloud
         .builds
         .get(bid)
@@ -5656,7 +5858,12 @@ async fn mirror_remote_build(
                 );
             }
             if now_ms() > deadline {
-                cloud.builds.log(bid, format!("✗ {node}: lost contact with remote build after {polls_failed} failed polls"));
+                cloud.builds.log(
+                    bid,
+                    format!(
+                        "✗ {node}: lost contact with remote build after {polls_failed} failed polls"
+                    ),
+                );
                 // NOT a build failure: this node never told us its app failed —
                 // we simply could not read it. Treated as unreachable so it
                 // degrades capacity instead of vetoing healthy regions.
@@ -6241,6 +6448,227 @@ async fn produce_manifest(
     }
 }
 
+/// The module a direct-interpreter `start_cmd` names, when the argv is one
+/// plain `node <entry>` / `bun <entry>` / `bun run <entry>` launch. `None`
+/// for every other shape — package-manager and script indirection (`npm
+/// start`, `bun run start`), `next start`, container/python/command runtimes,
+/// stdin/eval/REPL forms, and any Node option that takes the NEXT argv as its
+/// value (`-r x`, `--require x`, `--import x`, `--loader x`), because there
+/// the first non-option argument is not the entry. `None` means "not this
+/// check's business": the backend's own launch validation still runs. Only
+/// `--flag` / `--flag=value` options are skipped ahead of the entry; a
+/// short `-x` option bails out for the same reason.
+fn direct_launch_entry(start_cmd: &[String]) -> Option<String> {
+    let first = start_cmd.first()?;
+    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    let mut rest = start_cmd[1..].iter();
+    let candidate = match base {
+        "node" | "nodejs" => loop {
+            let arg = rest.next()?;
+            if !arg.starts_with('-') {
+                break arg;
+            }
+            let value_taking = matches!(
+                arg.as_str(),
+                "--require"
+                    | "--import"
+                    | "--loader"
+                    | "--experimental-loader"
+                    | "--eval"
+                    | "--print"
+                    | "--input-type"
+                    | "--interactive"
+            );
+            if value_taking || !arg.starts_with("--") {
+                return None;
+            }
+        },
+        "bun" => {
+            let arg = rest.find(|arg| !arg.starts_with('-'))?;
+            let arg = if arg == "run" {
+                rest.find(|arg| !arg.starts_with('-'))?
+            } else {
+                arg
+            };
+            let path_shaped = arg.contains('/')
+                || Path::new(arg).extension().is_some_and(|extension| {
+                    matches!(
+                        extension.to_str(),
+                        Some("js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx")
+                    )
+                });
+            if !path_shaped {
+                return None;
+            }
+            arg
+        }
+        _ => return None,
+    };
+    let path = Path::new(candidate);
+    let plain_relative = !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+        && path.components().any(|component| matches!(component, Component::Normal(_)));
+    plain_relative.then(|| candidate.clone())
+}
+
+/// Build-time launch-shape preflight: every function whose `start_cmd` is a
+/// direct `node`/`bun` launch ([`direct_launch_entry`]) must have its entry
+/// module present in the runtime artifact tree that is about to be sealed
+/// (`checkout_root/app_rel/cwd_relative/<entry>`, plus Node's extensionless
+/// `.js`/`.mjs`/`.cjs` resolution; a directory counts, Node resolves its
+/// `index.js`). Deliberately conservative — it fires only when NOTHING exists
+/// at the entry, the one case that is provably unlaunchable on every backend
+/// (mock spawns `node <entry>` from the same tree; litebox refuses the launch
+/// against the same sealed bytes; the microVM agent execs the same path).
+/// The refusal names the function, the entry, the exact checkout-relative
+/// path examined, what the sealed root actually contains, and the field that
+/// chose the entry: `fluid.json functions[N].start_cmd` — whose lane ships
+/// the checkout as-is with no install/build command — or the build-derived
+/// start command (package.json `scripts.start` / framework detection).
+async fn preflight_direct_entries(
+    manifest: &Manifest,
+    runtime_artifact: &hive_backend::RuntimeArtifactSpec,
+    fluid_json_present: bool,
+) -> anyhow::Result<()> {
+    let host_root = runtime_artifact.host_static_root()?;
+    for (index, function) in manifest.functions.iter().enumerate() {
+        let runtime = hive_core::Runtime::resolve(&function.runtime, &function.start_cmd);
+        if !matches!(runtime, hive_core::Runtime::Node | hive_core::Runtime::Bun) {
+            continue;
+        }
+        let Some(entry) = direct_launch_entry(&function.start_cmd) else {
+            continue;
+        };
+        let cwd = function
+            .cwd_relative
+            .as_deref()
+            .map(str::trim)
+            .filter(|cwd| !cwd.is_empty() && *cwd != ".")
+            .map(Path::new);
+        let base = match cwd {
+            Some(cwd) => host_root.join(cwd),
+            None => host_root.clone(),
+        };
+        let candidates: Vec<PathBuf> = std::iter::once(base.join(&entry))
+            .chain(
+                ["js", "mjs", "cjs"]
+                    .iter()
+                    .map(|extension| base.join(format!("{entry}.{extension}"))),
+            )
+            .collect();
+        let mut present = false;
+        for candidate in &candidates {
+            if tokio::fs::symlink_metadata(candidate).await.is_ok() {
+                present = true;
+                break;
+            }
+        }
+        if present {
+            continue;
+        }
+
+        let mut examined = runtime_artifact.app_rel.clone();
+        if let Some(cwd) = cwd {
+            examined.push(cwd);
+        }
+        examined.push(&entry);
+        let examined = examined
+            .components()
+            .filter(|component| !matches!(component, Component::CurDir))
+            .collect::<PathBuf>()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut root_listing: Vec<String> = match tokio::fs::read_dir(&base).await {
+            Ok(mut entries) => {
+                let mut names = Vec::new();
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let mut name = entry.file_name().to_string_lossy().into_owned();
+                    if entry.file_type().await.map(|kind| kind.is_dir()).unwrap_or(false) {
+                        name.push('/');
+                    }
+                    names.push(name);
+                }
+                names
+            }
+            Err(_) => Vec::new(),
+        };
+        root_listing.sort();
+        let shown = root_listing.len().min(16);
+        let mut listing = root_listing[..shown].join(", ");
+        if root_listing.len() > shown {
+            listing.push_str(&format!(", … ({} more)", root_listing.len() - shown));
+        }
+        let scripts = tokio::fs::read_to_string(base.join("package.json"))
+            .await
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .map(|package| {
+                let pick = |key: &str| {
+                    package
+                        .get("scripts")
+                        .and_then(|scripts| scripts.get(key))
+                        .and_then(|value| value.as_str())
+                        .map(|value| format!("scripts.{key} = {value:?}"))
+                };
+                let main = package
+                    .get("main")
+                    .and_then(|value| value.as_str())
+                    .map(|value| format!("main = {value:?}"));
+                [pick("start"), pick("build"), main]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|summary| !summary.is_empty());
+        let interpreter = function.start_cmd.first().cloned().unwrap_or_default();
+        let function_label = if function.name.is_empty() {
+            format!("functions[{index}]")
+        } else {
+            format!("{:?} (functions[{index}])", function.name)
+        };
+        let deciding_field = if fluid_json_present {
+            format!(
+                "fluid.json functions[{index}].start_cmd = {:?}",
+                function.start_cmd
+            )
+        } else {
+            format!(
+                "the build-derived start command {:?} (package.json scripts.start / framework detection)",
+                function.start_cmd
+            )
+        };
+        let lane = if fluid_json_present {
+            "A fluid.json deployment ships the repository checkout AS-IS — no install or build \
+             command runs (\"Detected fluid.json — using project configuration\") — so the entry \
+             must be committed to the repository. Fix one of: commit the file the start_cmd \
+             names; point start_cmd at a committed file; or remove fluid.json so framework \
+             detection runs the install + build and derives the start command from package.json."
+                .to_string()
+        } else {
+            "The install/build steps that ran did not produce it — check the build output and \
+             the framework's output directory, or set an explicit start command in the project's \
+             build settings."
+                .to_string()
+        };
+        let msg = format!(
+            "Launch preflight failed for function {function_label}: main entry {entry:?} — chosen \
+             by {deciding_field} — does not exist in the deployment tree about to be sealed. \
+             Looked for {examined:?} (and {entry}.js/.mjs/.cjs) relative to the repository \
+             checkout; the deployment root contains [{listing}]{}. {lane} The `{interpreter}` \
+             process would exit immediately on every backend, so the deployment was NOT \
+             registered.",
+            scripts
+                .map(|summary| format!("; package.json declares {summary}"))
+                .unwrap_or_default(),
+        );
+        return Err(anyhow::anyhow!(msg));
+    }
+    Ok(())
+}
+
 /// Whether to use `npm ci` (a clean, lockfile-exact install) instead of
 /// `npm install`. Restricted to npm projects that have a committed
 /// `package-lock.json` (yarn/pnpm have their own lockfiles), and only when this
@@ -6336,7 +6764,9 @@ impl<'a> PackageManagerLauncher<'a> {
 
     fn add_svelte_adapter(&self) -> String {
         let arguments = match self.detection.manager {
-            "npm" => "install -D --no-save --package-lock=false --no-audit --no-fund --legacy-peer-deps \"$spec\"",
+            "npm" => {
+                "install -D --no-save --package-lock=false --no-audit --no-fund --legacy-peer-deps \"$spec\""
+            }
             "pnpm" => "add -D --lockfile=false --config.strict-peer-dependencies=false \"$spec\"",
             "yarn" => "add -D \"$spec\"",
             "bun" => "add -d \"$spec\"",
@@ -7211,7 +7641,9 @@ done' hive-delink {} +
                     let prm = fluid_build::per_route::discover(&next_dir);
                     log(format!(
                         "per-route: classified {} route(s) — {} per-route-eligible (Node), {} on next-start fallback (static/edge/middleware).",
-                        prm.routes.len(), prm.eligible_count(), prm.fallback_count()
+                        prm.routes.len(),
+                        prm.eligible_count(),
+                        prm.fallback_count()
                     ));
                     // Map build-time classification -> runtime policy (#16), persisted
                     // into the manifest so the serve path can apply route-type-aware
@@ -7612,6 +8044,37 @@ fn static_manifest(project: &str, static_dir: &str) -> Manifest {
     }
 }
 
+/// Walk up from `dir` looking for `node_modules/next/dist/bin/next` as a
+/// regular file — Next's real CLI entry, independent of npm's `.bin/next`
+/// shim (see `detect_start_cmd`'s doc comment for why the shim path is
+/// broken on this platform's sealed runtime artifacts). Mirrors
+/// `litebox.rs`'s `next_entry_for` walk-up exactly, so both resolve the
+/// identical real path for the identical reason. Returns a path RELATIVE to
+/// `dir` (e.g. `node_modules/next/dist/bin/next` or, in a monorepo,
+/// `../../node_modules/next/dist/bin/next`) — `start_cmd[0]` is resolved
+/// against the deployed workdir at launch time
+/// (`Command::new(&func.start_cmd[0]).current_dir(&workdir)` in mock.rs),
+/// never against this build-time absolute path, which will not exist once
+/// the app is sealed into its own runtime-artifact directory.
+async fn find_next_dist_bin(dir: &Path) -> Option<String> {
+    let mut up = PathBuf::new();
+    let mut base = dir.to_path_buf();
+    loop {
+        let candidate = base.join("node_modules/next/dist/bin/next");
+        if tokio::fs::metadata(&candidate)
+            .await
+            .is_ok_and(|m| m.is_file())
+        {
+            let relative = up.join("node_modules/next/dist/bin/next");
+            return Some(relative.to_str()?.to_string());
+        }
+        if !base.pop() {
+            return None;
+        }
+        up.push("..");
+    }
+}
+
 /// The command that boots the built app's production server.
 async fn detect_start_cmd(dir: &Path, runtime: Option<hive_core::Runtime>) -> Vec<String> {
     if runtime == Some(hive_core::Runtime::Wasmer) {
@@ -7622,7 +8085,49 @@ async fn detect_start_cmd(dir: &Path, runtime: Option<hive_core::Runtime>) -> Ve
     let bun = runtime == Some(hive_core::Runtime::Bun);
     if let Ok(pkg) = tokio::fs::read_to_string(dir.join("package.json")).await {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pkg) {
-            if v.get("scripts").and_then(|s| s.get("start")).is_some() {
+            if let Some(start_script) = v
+                .get("scripts")
+                .and_then(|s| s.get("start"))
+                .and_then(|s| s.as_str())
+            {
+                // A plain `next start` script resolves through `npm start` ->
+                // `node_modules/.bin/next`, and on every backend that runs this
+                // as a real host process (mock; litebox independently works
+                // around the identical problem at its own layer — see
+                // `litebox.rs`'s `next_entry_for`) `.bin/next` is NOT the npm-
+                // created symlink to `node_modules/next/dist/bin/next`: the
+                // runtime-artifact sealing step (`runtime_artifact.rs`,
+                // `materialize_entry`) dereferences every symlink into a flat
+                // byte-for-byte copy for its content-addressed integrity
+                // hashing, npm .bin shims included. Next's own `bin/next`
+                // script does `require("../server/require-hook")` — a path
+                // valid ONLY relative to its real location
+                // (`next/dist/bin/`) — so the flattened copy at `.bin/next`
+                // throws `Cannot find module '../server/require-hook'` on
+                // EVERY cold start, 100% reproducible, confirmed live against
+                // a real sealed artifact. Preserving symlinks through sealing
+                // is the deeper fix but touches security-critical,
+                // integrity-hashing code shared by every deployment on every
+                // backend; resolving the well-known `next start` shape to
+                // Next's real dist/bin entry here — mirroring the exact
+                // working pattern litebox already uses independently — fixes
+                // it without touching sealing at all. Text-matched, not
+                // shelled out to: `next start` / `next start -p $PORT` /
+                // `next start -p ${PORT}` are the only shapes recognized, so
+                // an app with extra flags or env prefixes (`NODE_ENV=x next
+                // start`) falls through unchanged to the ordinary npm-start
+                // path below.
+                if !bun {
+                    let trimmed = start_script.trim();
+                    let is_plain_next_start = trimmed == "next start"
+                        || trimmed == "next start -p $PORT"
+                        || trimmed == "next start -p ${PORT}";
+                    if is_plain_next_start {
+                        if let Some(next_bin) = find_next_dist_bin(dir).await {
+                            return vec!["node".into(), next_bin, "start".into()];
+                        }
+                    }
+                }
                 // Bun's own script-runner honors package.json#scripts.start
                 // identically to `npm start` (package.json-script INDIRECTION —
                 // the script's own text is executed as a shell command), so
@@ -8415,7 +8920,9 @@ async fn warmup_bun_bytecode(
                 .to_string_lossy()
                 .into_owned();
             let ver = bun_version(&bun_bin).await.unwrap_or_else(|| "?".into());
-            log(format!("Bytecode-cache: bundled + precompiled `{entry_arg}` -> `{rel}` (bun {ver}, with external source map)."));
+            log(format!(
+                "Bytecode-cache: bundled + precompiled `{entry_arg}` -> `{rel}` (bun {ver}, with external source map)."
+            ));
             vec!["bun".to_string(), "run".to_string(), rel]
         }
         Ok(o) => {
@@ -8424,11 +8931,15 @@ async fn warmup_bun_bytecode(
                 .chars()
                 .take(300)
                 .collect();
-            log(format!("Bytecode-cache: bun build failed ({stderr}); using the original entry uncached — app still starts normally."));
+            log(format!(
+                "Bytecode-cache: bun build failed ({stderr}); using the original entry uncached — app still starts normally."
+            ));
             original
         }
         Err(e) => {
-            log(format!("Bytecode-cache: could not run `bun build` ({e}); using the original entry uncached."));
+            log(format!(
+                "Bytecode-cache: could not run `bun build` ({e}); using the original entry uncached."
+            ));
             original
         }
     }
@@ -9055,11 +9566,7 @@ async fn command_version(program: &Path, args: &[&str], cwd: &Path) -> String {
         Ok(Ok(output)) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if stdout.is_empty() {
-                stderr
-            } else {
-                stdout
-            }
+            if stdout.is_empty() { stderr } else { stdout }
         }
         _ => "unavailable".to_string(),
     }
@@ -9514,8 +10021,8 @@ async fn parse_expose(path: &Path) -> Option<u16> {
 /// trailingSlash, images, crons, and per-function overrides (matched by glob).
 fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &dyn Fn(String)) {
     use fluid_core::{
-        redirect_status, CondValue, CronSpec, Header, HeaderRule, ImagesConfig, LocalPattern,
-        Redirect, RemotePattern, Rewrite, RuleCondition,
+        CondValue, CronSpec, Header, HeaderRule, ImagesConfig, LocalPattern, Redirect,
+        RemotePattern, Rewrite, RuleCondition, redirect_status,
     };
 
     let conv_conds = |cs: &[fluid_build::VercelCondition]| -> Vec<RuleCondition> {
@@ -10852,6 +11359,7 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
         image_pids: None,
         image_ports: None,
         git_token: token,
+        marketplace_placement: None,
     };
     let build_id = match start_build(cloud.clone(), req, None, None).await {
         Ok(id) => id,
@@ -11102,9 +11610,11 @@ mod tests {
         assert!(adapter_manifest("p", "nextjs", &dir, None).await.is_none());
         // No server function yet → None even for opennext.
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(adapter_manifest("p", "opennext", &dir, None)
-            .await
-            .is_none());
+        assert!(
+            adapter_manifest("p", "opennext", &dir, None)
+                .await
+                .is_none()
+        );
         // Full OpenNext output → hybrid manifest (assets + origin fallthrough).
         std::fs::create_dir_all(dir.join(".open-next/server-functions/default")).unwrap();
         std::fs::write(
@@ -11660,13 +12170,15 @@ mod tests {
         assert_eq!(sanitize_tag("---weird///name---"), "weird-name");
         assert_eq!(sanitize_tag(""), "app");
         // Only [a-z0-9._-] survive.
-        assert!(sanitize_tag("Foo/Bar:Baz")
-            .chars()
-            .all(|c| c.is_ascii_lowercase()
-                || c.is_ascii_digit()
-                || c == '.'
-                || c == '_'
-                || c == '-'));
+        assert!(
+            sanitize_tag("Foo/Bar:Baz")
+                .chars()
+                .all(|c| c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || c == '.'
+                    || c == '_'
+                    || c == '-')
+        );
     }
 
     #[test]

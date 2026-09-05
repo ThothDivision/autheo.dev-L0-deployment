@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "Snapshot migration helpers must ship alongside the active GuardianDB format so they can be enabled during a controlled data migration."
+)]
+
 //! GuardianDB backend — **always on**, in local/dev and production alike.
 //!
 //! [guardian-db] is an iroh-native, content-addressed store (iroh-docs +
@@ -20,9 +25,9 @@
 
 use std::sync::{Arc, OnceLock};
 
+use guardian_db::guardian::GuardianDB;
 use guardian_db::guardian::core::NewGuardianDBOptions;
 use guardian_db::guardian::error::GuardianError;
-use guardian_db::guardian::GuardianDB;
 use guardian_db::p2p::network::client::IrohClient;
 use guardian_db::p2p::network::config::ClientConfig;
 use guardian_db::traits::KeyValueStore;
@@ -164,8 +169,8 @@ static INIT_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static INIT_INFLIGHT: std::sync::Mutex<Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>> =
     std::sync::Mutex::new(None);
 
-fn inflight_slot(
-) -> std::sync::MutexGuard<'static, Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>> {
+fn inflight_slot()
+-> std::sync::MutexGuard<'static, Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>> {
     // A poisoned lock here must not take guardian down — the slot holds a
     // JoinHandle, and recovering it is strictly better than failing init.
     INIT_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner())
@@ -4575,13 +4580,21 @@ async fn await_final_generation(
     }
 }
 
+/// Budget for EACH of `shutdown`'s three sequential waits (final generation,
+/// writer join, backend shutdown). The GuardianDB writer commits one
+/// generation per 40–75 s on this fleet, so the final-generation wait needs a
+/// full commit cadence to succeed and a 60 s budget never did (measured over
+/// 75 stops: it timed out on every one) — it only kept a node whose listener
+/// was already closed and whose state was already flushed alive as a mesh
+/// black hole for a further minute. 10 s bounds that cost to what the graceful
+/// tail can afford under the 75 s hard deadline.
 fn guardian_shutdown_timeout() -> std::time::Duration {
     std::env::var("HIVE_GUARDIAN_SHUTDOWN_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .map(std::time::Duration::from_millis)
-        .unwrap_or(std::time::Duration::from_secs(60))
+        .unwrap_or(std::time::Duration::from_secs(10))
 }
 
 /// Drain the terminal replication generation, stop and join its sole writer,
@@ -5832,7 +5845,7 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         p2_publish_generation(h, &component, "a", now.saturating_sub(5000)).await?;
     let (_head_b, state_b, state_b_len) =
         p2_publish_generation(h, &component, "b", now.saturating_sub(4000)).await?;
-    let (head_c, state_c, state_c_len) =
+    let (_head_c, state_c, state_c_len) =
         p2_publish_generation(h, &component, "c", now.saturating_sub(3000)).await?;
     if !matches!(
         guardian_v2_probe(h, &encoded).await,
@@ -6876,8 +6889,8 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
 /// Served over the mesh at `GET /v1/guardian/heads` (see `admin::guardian_heads`
 /// + `gossip::dispatch`) so a peer can diff against its own without pulling
 /// any content.
-pub async fn namespace_heads(
-) -> std::collections::HashMap<String, Vec<guardian_db::traits::EntryHead>> {
+pub async fn namespace_heads()
+-> std::collections::HashMap<String, Vec<guardian_db::traits::EntryHead>> {
     let mut out = std::collections::HashMap::new();
     if let Ok(h) = handle().await {
         match h.kv.entry_heads().await {

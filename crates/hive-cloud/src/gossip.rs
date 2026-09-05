@@ -74,6 +74,32 @@ pub async fn probe(
 /// functions). Falls back to `addr_json` unchanged when `node_id` isn't found in
 /// the registry (e.g. a bootstrap seed never gossiped as a full `NodeInfo`).
 fn relay_hinted_addr(cloud: &Arc<CloudState>, node_id: &str, addr_json: &str) -> String {
+    // A relay in `addr_json` is the peer's OWN home relay — the one it is
+    // actually attached to, straight from its signed gossip (`iroh_addr`) —
+    // and a relay only carries traffic to peers attached to it. Steering the
+    // dial away from it to `relay_url` (the embedded relay the peer SERVES,
+    // `http://<public-ip>:3341`) replaced a live transport with a dead one
+    // fleet-wide: measured 2026-09-01 from fc-frankfurt, fc-sanjose and
+    // fc-sanjose-3, every Tencent host's :3341 is TCP-unreachable from every
+    // other Tencent host (and from itself via its public IP — the security
+    // group, not the listener), while every `*.relay.shadw.app:3343` answers
+    // 200 from all three. With the dead hint substituted, a dial to
+    // fc-frankfurt had exactly one path (direct UDP) and timed out at the 5s
+    // cached-hint budget ~10 times a minute whenever that path flapped — the
+    // eight failed express deploys. So: keep the peer's own relay when it has
+    // one; steer ONLY an addr that carries no relay at all (a peer learned
+    // second-hand before it ever gossiped its home relay), which is the case
+    // `with_relay_hint` was written for.
+    if serde_json::from_str::<iroh::EndpointAddr>(addr_json)
+        .map(|a| {
+            a.addrs
+                .iter()
+                .any(|t| matches!(t, iroh::TransportAddr::Relay(_)))
+        })
+        .unwrap_or(false)
+    {
+        return addr_json.to_string();
+    }
     let nodes = cloud.registry.nodes();
     // Match on endpoint id OR node name. `node_id` here is whatever the caller had:
     // `request_to`'s callers pass a 64-hex `peer_id`, but `fetch` pulls its tuple
@@ -805,6 +831,74 @@ async fn dispatch_verified(
                     }
                 },
                 Err(_) => Vec::new(),
+            }
+        }
+        // Sandbox owner hops (leader -> owner), the mesh half of
+        // `sandboxes_api::internal_hop`: a delegated CREATE on a node whose
+        // backend can exec (the leader's cannot), and the ONE typed owner RPC
+        // every cell-touching mutation rides (stop/delete/run/kill). Both
+        // handlers re-derive authority on the receiving node (fleet service
+        // credential + tenant binding via `require_internal_hop`, owner ==
+        // self via the record) and never re-proxy. A handler refusal is
+        // wrapped in `refused_envelope` so the leader can tell a typed "no"
+        // (nothing applied) from a dead transport (unknown). Same
+        // `x-hive-internal` posture as the provision-local arm above.
+        p if method == hive_p2p::GOSSIP_POST
+            && matches!(
+                p.split('?').next(),
+                Some(crate::sandboxes_api::DELEGATE_CREATE_PATH)
+                    | Some(crate::sandboxes_api::OWNER_OP_PATH)
+            ) =>
+        {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&t) {
+                    headers.insert("x-hive-internal", hv);
+                }
+            }
+            let is_create = p.split('?').next() == Some(crate::sandboxes_api::DELEGATE_CREATE_PATH);
+            let parsed = match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(v) => v,
+                Err(_) => return Vec::new(),
+            };
+            let outcome = if is_create {
+                match serde_json::from_value(parsed) {
+                    Ok(req) => {
+                        crate::sandboxes_api::delegate_create_sandbox(
+                            State(cloud.clone()),
+                            headers,
+                            team_claims(p),
+                            axum::Json(req),
+                        )
+                        .await
+                    }
+                    Err(e) => Err((
+                        axum::http::StatusCode::BAD_REQUEST,
+                        serde_json::json!({ "error": format!("bad delegate body: {e}") })
+                            .to_string(),
+                    )),
+                }
+            } else {
+                match serde_json::from_value(parsed) {
+                    Ok(req) => {
+                        crate::sandboxes_api::owner_op(
+                            State(cloud.clone()),
+                            headers,
+                            team_claims(p),
+                            axum::Json(req),
+                        )
+                        .await
+                    }
+                    Err(e) => Err((
+                        axum::http::StatusCode::BAD_REQUEST,
+                        serde_json::json!({ "error": format!("bad owner-op body: {e}") })
+                            .to_string(),
+                    )),
+                }
+            };
+            match outcome {
+                Ok(j) => jb(j),
+                Err((status, body)) => crate::sandboxes_api::refused_envelope(status, &body),
             }
         }
         // Companion to the provision-local arm above: `admin::database_delete`
@@ -2029,7 +2123,7 @@ pub async fn fetch(
     // (issue() returns Err, so no header is added -- matching dev/single-node
     // behavior exactly as before).
     if method == hive_p2p::GOSSIP_POST {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", "mesh", "service", false, 60) {
+        if let Ok(tok) = crate::auth::issue("mesh-internal", "mesh", "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
             req = req.header("authorization", format!("Bearer {tok}"));
         }
     }

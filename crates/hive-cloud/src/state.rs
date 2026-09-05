@@ -203,6 +203,10 @@ pub struct CloudState {
     /// Node-local write-ahead evidence for accepted deployments, production
     /// alias revisions, and retryable lifecycle delivery.
     pub deployment_ledger: Arc<crate::deployment_ledger::DeploymentLedger>,
+    /// This node's own signing identity for the deployment integrity chain
+    /// (`hive_core::integrity`) — per-node, never fleet-shared. See
+    /// `integrity_signer.rs`'s module doc.
+    pub integrity_signer: Arc<crate::integrity_signer::IntegritySigner>,
     /// Bounded, durable receiver for exact runtime-artifact packages. Every
     /// mutation is serialized by its owned worker and bound to the current
     /// project incarnation before it enters the queue.
@@ -304,6 +308,12 @@ pub struct CloudState {
     pub domains: crate::dns::DomainStore,
     pub docs: crate::docstore::DocStore,
     pub billing: crate::billing::BillingStore,
+    /// Marketplace allocations are replicated control-plane records. They
+    /// contain authorization metadata only; no mesh credentials or workloads.
+    pub marketplace_allocations: crate::marketplace::AllocationStore,
+    /// Durable HMAC nonce replay facts, opaque advertisements, and Marketplace
+    /// payment intents. This is replicated because public API reads round-robin.
+    pub marketplace_security: crate::marketplace::MarketplaceSecurityStore,
     pub audit: crate::audit::AuditLog,
     pub notifications: crate::notifications::NotificationStore,
     /// Web-push subscriptions + SMS targets + delivery watermarks (see
@@ -585,6 +595,7 @@ impl CloudState {
         fluid: Arc<Fluid>,
         hive: Arc<Hive>,
         firecracker: Option<Arc<hive_backend::firecracker::FirecrackerBackend>>,
+        sandbox_backend: Option<Arc<dyn hive_backend::CellBackend>>,
     ) -> Arc<CloudState> {
         let configured_trusted_peer_ids = configured_endpoint_ids("HIVE_TRUSTED_NODE_IDS")
             .unwrap_or_else(|error| panic!("invalid mesh trust configuration: {error}"));
@@ -611,6 +622,11 @@ impl CloudState {
             &node_name,
         )
         .unwrap_or_else(|error| panic!("deployment ledger failed closed: {error:#}"));
+        let integrity_signer = Arc::new(
+            crate::integrity_signer::IntegritySigner::open_or_create(&node_name).unwrap_or_else(
+                |error| panic!("integrity signing key failed closed: {error:#}"),
+            ),
+        );
         let runtime_artifact_transfer = crate::runtime_artifact_transfer::TransferService::open(
             crate::persist::data_dir().join("runtime-artifacts-v1"),
             node_name.clone(),
@@ -690,6 +706,11 @@ impl CloudState {
         let teams = crate::teams::TeamStore::new();
         teams.ensure_seed(&owner_email);
         let region_for_sandboxes = region.clone();
+        let node_name_for_sandboxes = node_name.clone();
+        // One shared client for general platform HTTP + the geo lookup cache
+        // (reqwest::Client is Arc-backed internally, so cloning it is cheap
+        // and shares one connection pool instead of opening two).
+        let http = reqwest::Client::new();
         let state = Arc::new(CloudState {
             region,
             node_name,
@@ -724,8 +745,8 @@ impl CloudState {
             gw,
             fluid,
             hive,
-            http: reqwest::Client::new(),
-            dns_geo: crate::dns_geo::GeoCache::spawn(reqwest::Client::new()),
+            http: http.clone(),
+            dns_geo: crate::dns_geo::GeoCache::spawn(http),
             dns_probes: Arc::new(crate::dns_probe::NsProbes::new()),
             acme_challenges: crate::acme::AcmeChallengeStore::new(),
             acme_http01: crate::acme::Http01Store::new(),
@@ -734,6 +755,7 @@ impl CloudState {
             builds: crate::git::BuildStore::new(),
             build_cancels: crate::git::BuildCancelRegistry::new(),
             deployment_ledger,
+            integrity_signer,
             runtime_artifact_transfer,
             cluster,
             teams,
@@ -777,13 +799,16 @@ impl CloudState {
             domains: crate::dns::DomainStore::new(),
             docs: crate::docstore::DocStore::new(),
             billing: crate::billing::BillingStore::new(),
+            marketplace_allocations: crate::marketplace::AllocationStore::default(),
+            marketplace_security: crate::marketplace::MarketplaceSecurityStore::default(),
             audit: crate::audit::AuditLog::new(crate::persist::data_dir().join("audit.jsonl")),
             notifications: crate::notifications::NotificationStore::new(),
             push: crate::push::PushStore::new(),
             enterprise: Arc::new(crate::enterprise::EnterpriseStore::new()),
             sandboxes: Arc::new(crate::sandboxes_platform::PlatformSandboxProvider::new(
                 region_for_sandboxes,
-                firecracker.clone(),
+                sandbox_backend,
+                node_name_for_sandboxes,
             )),
             firecracker,
             owner_email,
